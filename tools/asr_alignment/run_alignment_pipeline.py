@@ -231,7 +231,10 @@ def _build_summary(
             local_scores[engine] += float(candidate.get("local_alignment_score", candidate.get("alignment_score", 0.0)))
             drift_abs[engine] += abs(int(candidate.get("span_drift_start", 0))) + abs(int(candidate.get("span_drift_end", 0)))
             if candidate.get("unusable_reason"):
-                unusable_counts[candidate.get("unusable_reason")] += 1
+                unusable_reason = candidate.get("unusable_reason")
+                if isinstance(unusable_reason, list):
+                    unusable_reason = "|".join(str(item) for item in unusable_reason)
+                unusable_counts[str(unusable_reason)] += 1
             if candidate.get("boundary_contamination"):
                 contamination_counts[engine] += 1
             if abs(int(candidate.get("span_drift_start", 0))) > 80 or abs(int(candidate.get("span_drift_end", 0))) > 80:
@@ -618,6 +621,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         apple_artifact=apple_artifact,
         alignments=alignments,
         output_dir=output_dir,
+        candidate_build_mode=args.candidate_build_mode,
+        workers=args.workers,
+        no_parallel=args.no_parallel,
     )
     print(f"[pipeline] build block candidates end count={len(block_rows)}", flush=True)
     print("[pipeline] normalize flags start", flush=True)
@@ -678,6 +684,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     )
     summary["block_summary"] = block_summary
     summary["normalized_summary"] = normalized_summary
+    summary["alignment_text_used_for_text_score"] = True
+    summary["boundary_text_used_for_main_text_score"] = False
+    summary["boundary_hints_used_for_boundary_eval"] = bool(summary.get("boundary_hint_used_in_candidate_boundary_eval"))
+    summary["punctuation_hard_matched_as_normal_chars"] = False
     review_sample_rows = _build_review_sample_rows(normalized_rows)
     review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -708,6 +718,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-api-key", default="local-qwen3-assistant")
     parser.add_argument("--llm-max-segments", type=int, default=200)
     parser.add_argument("--llm-only-risky", action="store_true")
+    parser.add_argument("--candidate-build-mode", choices=["full", "staged", "qwen-only"], default="staged")
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--no-parallel", action="store_true")
     return parser
 
 

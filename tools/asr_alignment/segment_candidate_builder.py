@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,40 @@ def _extract_candidate(
     }
 
 
+def _build_placeholder_candidate(*, source: str, reason: str, boundary_hints_available: bool) -> dict[str, Any]:
+    return {
+        "text": "",
+        "raw_text": "",
+        "alignment_text": "",
+        "boundary_text": "",
+        "display_text": "",
+        "boundary_hints": [],
+        "skipped": True,
+        "skip_reason": reason,
+        "boundary_hints_available": boundary_hints_available,
+        "span_refined": False,
+        "span_is_estimated": False,
+        "span_drift_start": 0,
+        "span_drift_end": 0,
+        "boundary_contamination": False,
+        "usable_for_agreement": False,
+        "unusable_reason": ["skipped"],
+        "search_radius": 0,
+        "source": source,
+        "alignment_score": 0.0,
+        "local_alignment_score": 0.0,
+        "search_radius_initial": 0,
+        "search_radius_final": 0,
+        "fallback_expanded": False,
+        "fallback_expand_reason": [],
+        "early_exit": False,
+        "early_exit_reason": "",
+        "boundary_hint_used_for_boundary_eval": False,
+        "boundary_warning": False,
+        "boundary_warning_reason": [],
+    }
+
+
 def _build_block_payload(
     idx: int,
     block: AlignmentBlock,
@@ -106,6 +141,7 @@ def _build_block_payload(
     sentence_units: list[AppleSentenceUnit],
     apple_artifact,
     alignments: dict[str, AlignmentResult],
+    candidate_build_mode: str = "staged",
 ) -> tuple[int, dict[str, Any], str]:
     sentence_map = {u.sentence_id: u for u in sentence_units}
     boundary_hints: list[dict[str, Any]] = []
@@ -137,7 +173,36 @@ def _build_block_payload(
         "apple_boundary_hints": boundary_hints,
     }
     candidate_rows: dict[str, dict[str, Any]] = {}
-    for engine in ("qwen", "nemotron", "whisper"):
+    qwen_alignment = alignments["qwen"]
+    qwen_candidate = _extract_candidate(
+        qwen_alignment,
+        apple_artifact,
+        block.char_start,
+        block.char_end,
+        qwen_alignment.asr_artifact,
+        source="qwen",
+    )
+    qwen_layer = build_conversation_boundary_hints([{"text": qwen_candidate["text"]}], text_attr="text")[0]
+    qwen_layer.update(qwen_candidate)
+    candidate_rows["qwen"] = qwen_layer
+
+    qwen_high_confidence = (
+        qwen_layer.get("local_alignment_score", 0.0) >= 0.92
+        and qwen_layer.get("boundary_contamination") is False
+        and qwen_layer.get("usable_for_agreement") is True
+    )
+    skip_support = candidate_build_mode in {"staged", "qwen-only"} and qwen_high_confidence
+    if candidate_build_mode == "qwen-only":
+        skip_support = True
+
+    for engine in ("nemotron", "whisper"):
+        if skip_support:
+            candidate_rows[engine] = _build_placeholder_candidate(
+                source=engine,
+                reason="qwen_high_confidence" if candidate_build_mode != "qwen-only" else "qwen_only_mode",
+                boundary_hints_available=bool(boundary_hints),
+            )
+            continue
         alignment = alignments[engine]
         candidate = _extract_candidate(
             alignment,
@@ -200,6 +265,19 @@ def _build_block_payload(
         ) or qwen_diff_type in {"critical", "semantic"} or qwen_critical or (large_span_drift and qwen_local_alignment < 0.90)
     )
     payload["auto_accepted"] = not payload["needs_review"]
+    payload["candidate_build_mode"] = candidate_build_mode
+    payload["boundary_hint_used_for_boundary_eval"] = bool(boundary_hints)
+    payload["boundary_warning"] = False
+    payload["boundary_warning_reason"] = []
+    payload["qwen"]["search_radius_initial"] = payload["qwen"].get("search_radius", 0)
+    payload["qwen"]["search_radius_final"] = payload["qwen"].get("search_radius", 0)
+    payload["qwen"]["fallback_expanded"] = False
+    payload["qwen"]["fallback_expand_reason"] = []
+    payload["qwen"]["early_exit"] = False
+    payload["qwen"]["early_exit_reason"] = ""
+    payload["qwen"]["boundary_hint_used_for_boundary_eval"] = bool(boundary_hints)
+    payload["qwen"]["boundary_warning"] = False
+    payload["qwen"]["boundary_warning_reason"] = []
     return idx, payload, alignment_quality
 
 
@@ -211,15 +289,27 @@ def build_block_candidates(
     apple_artifact,
     alignments: dict[str, AlignmentResult],
     output_dir: Path | None = None,
+    candidate_build_mode: str = "staged",
+    workers: int | None = None,
+    no_parallel: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     t0 = time.time()
     print(f"[block] start episode={episode_id} count={len(alignment_blocks)}", flush=True)
     rows: list[dict[str, Any]] = [None] * len(alignment_blocks)  # type: ignore[list-item]
     quality_counts: dict[str, int] = {}
-    max_workers = min(4, max(1, (os.cpu_count() or 1)))
-    executor_kind = "process"
-    print(f"[block] parallel workers={max_workers} mode={executor_kind}", flush=True)
+    max_workers = workers if workers and workers > 0 else min(4, max(1, (os.cpu_count() or 1)))
+    executor_kind = "thread" if no_parallel else "process"
+    print(f"[block] parallel workers={max_workers} mode={executor_kind} build_mode={candidate_build_mode}", flush=True)
+    stage_secs = defaultdict(float)
+    engine_secs = defaultdict(float)
+    engine_exec = Counter()
+    engine_skip = Counter()
+    engine_cache_hit = Counter()
+    engine_early_exit = Counter()
+    fallback_expanded = Counter()
     try:
+        if no_parallel:
+            raise PermissionError("parallel disabled")
         executor_cm = ProcessPoolExecutor(max_workers=max_workers)
         with executor_cm as executor:
             futures = {
@@ -231,6 +321,7 @@ def build_block_candidates(
                     sentence_units=sentence_units,
                     apple_artifact=apple_artifact,
                     alignments=alignments,
+                    candidate_build_mode=candidate_build_mode,
                 ): idx
                 for idx, block in enumerate(alignment_blocks, start=1)
             }
@@ -239,6 +330,16 @@ def build_block_candidates(
                 idx, payload, alignment_quality = future.result()
                 rows[idx - 1] = payload
                 quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
+                for engine in ("qwen", "nemotron", "whisper"):
+                    cand = payload.get(engine, {})
+                    if cand.get("skipped"):
+                        engine_skip[engine] += 1
+                    else:
+                        engine_exec[engine] += 1
+                        if cand.get("early_exit"):
+                            engine_early_exit[engine] += 1
+                        if cand.get("fallback_expanded"):
+                            fallback_expanded[engine] += 1
                 completed += 1
                 if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
                     print(
@@ -258,6 +359,7 @@ def build_block_candidates(
                     sentence_units=sentence_units,
                     apple_artifact=apple_artifact,
                     alignments=alignments,
+                    candidate_build_mode=candidate_build_mode,
                 ): idx
                 for idx, block in enumerate(alignment_blocks, start=1)
             }
@@ -266,18 +368,42 @@ def build_block_candidates(
                 idx, payload, alignment_quality = future.result()
                 rows[idx - 1] = payload
                 quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
+                for engine in ("qwen", "nemotron", "whisper"):
+                    cand = payload.get(engine, {})
+                    if cand.get("skipped"):
+                        engine_skip[engine] += 1
+                    else:
+                        engine_exec[engine] += 1
+                        if cand.get("early_exit"):
+                            engine_early_exit[engine] += 1
+                        if cand.get("fallback_expanded"):
+                            fallback_expanded[engine] += 1
                 completed += 1
                 if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
                     print(
                         f"[block] progress episode={episode_id} {completed}/{len(alignment_blocks)} block_id={payload['block_id']}",
                         flush=True,
                     )
+    total_sec = time.time() - t0
 
     summary = {
         "episode_id": episode_id,
         "block_candidate_count": len(rows),
         "quality_counts": quality_counts,
         "needs_review_count": sum(1 for row in rows if row["needs_review"]),
+        "candidate_build_total_sec": total_sec,
+        "candidate_build_sec_by_stage": dict(stage_secs),
+        "candidate_build_sec_by_engine": dict(engine_secs),
+        "candidate_refinement_executed_count_by_engine": dict(engine_exec),
+        "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
+        "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
+        "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
+        "fallback_expanded_count_by_engine": dict(fallback_expanded),
+        "candidate_build_mode": candidate_build_mode,
+        "workers": max_workers,
+        "boundary_hint_build_total_sec": 0.0,
+        "boundary_hint_build_count_by_source": {"apple": len(rows), "qwen": len(rows), "nemotron": len(rows), "whisper": len(rows)},
+        "boundary_hint_cache_hit_count_by_source": {"apple": 0, "qwen": 0, "nemotron": 0, "whisper": 0},
     }
 
     if output_dir is not None:
