@@ -79,17 +79,49 @@ def _normalize_review_reason(value: Any) -> list[str]:
     return []
 
 
+_PROTECTED_PREFIXES = (
+    "さあ",
+    "それ",
+    "そう",
+    "うん",
+    "いや",
+    "なるほど",
+    "という",
+    "というのも",
+    "それに対して",
+    "これ",
+    "だから",
+    "で、",
+    "はい",
+)
 _LEADING_FRAGMENT_RE = re.compile(r"^(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[ぁ-ゖァ-ヶ]{1,2}。|[一-龯]{1,2}。|ね。|よ。|うん。|あ。|え。|はい。|そう。|そうす|ですよ。|ですね、)$")
 _TRAILING_FRAGMENT_RE = re.compile(r"(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[ぁ-ゖァ-ヶ]{1,2}。|[一-龯]{1,2}。|建|実|な|ポイ|入れ|そうす)$")
+_LEAN_VALIDATION_PREFIXES = ("、", "。", "に対して", "を言うと", "の陣", "ほど。", "とです", "うのも", "は家")
+_LEAN_VALIDATION_SUFFIXES = ("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")
 
 
-def _cleanup_boundary_fragments(final_text: str, apple_text: str, selected_source: str) -> dict[str, Any]:
+def _cleanup_boundary_fragments(
+    final_text: str,
+    apple_text: str,
+    selected_source: str,
+    previous_final_text: str = "",
+    previous_selected_text: str = "",
+    next_final_text: str = "",
+    next_selected_text: str = "",
+) -> dict[str, Any]:
     original_text = str(final_text or "")
     apple_text = str(apple_text or "")
     selected_source = str(selected_source or "")
+    previous_final_text = str(previous_final_text or "")
+    previous_selected_text = str(previous_selected_text or "")
+    next_final_text = str(next_final_text or "")
+    next_selected_text = str(next_selected_text or "")
     result_text = original_text
     reasons: list[str] = []
     applied = False
+    attempted = False
+    protected_prefix_prevented = False
+    reverted = False
 
     if not result_text or selected_source == "apple":
         return {
@@ -97,47 +129,67 @@ def _cleanup_boundary_fragments(final_text: str, apple_text: str, selected_sourc
             "final_text_after_cleanup": result_text,
             "boundary_cleanup_applied": False,
             "boundary_cleanup_reason": [],
+            "boundary_cleanup_attempted": False,
+            "boundary_cleanup_reverted": False,
+            "cleanup_validation_failed": False,
+            "protected_prefix_prevented_cleanup": False,
         }
 
-    def _score(text: str) -> float:
-        return sequence_similarity(text, apple_text)
+    def _startswith_protected_prefix(text: str) -> bool:
+        return any(text.startswith(prefix) for prefix in _PROTECTED_PREFIXES)
 
-    baseline = _score(result_text)
-
-    def _choose_best_trim(is_leading: bool) -> tuple[str, str] | None:
-        best_text = result_text
-        best_reason = ""
-        best_score = baseline
-        candidates: list[tuple[int, str, str]] = []
-        limit = min(6, len(result_text) - 1)
-        for cut in range(1, limit + 1):
-            trimmed = result_text[cut:] if is_leading else result_text[:-cut]
+    def _trim_left_if_overlapping(text: str) -> tuple[str, str] | None:
+        nonlocal attempted, protected_prefix_prevented
+        if _startswith_protected_prefix(text):
+            protected_prefix_prevented = True
+            return None
+        if len(text) < 3:
+            return None
+        max_cut = min(6, len(text) - 1)
+        for cut in range(1, max_cut + 1):
+            fragment = text[:cut]
+            trimmed = text[cut:]
             if len(trimmed) < 3:
                 continue
-            fragment = result_text[:cut] if is_leading else result_text[-cut:]
-            if not fragment.strip():
+            if _startswith_protected_prefix(trimmed):
+                protected_prefix_prevented = True
                 continue
-            if not (
-                _LEADING_FRAGMENT_RE.match(fragment) if is_leading else _TRAILING_FRAGMENT_RE.search(fragment)
-            ):
-                continue
-            candidates.append((cut, trimmed, fragment))
-        for cut, trimmed, fragment in candidates:
-            score = _score(trimmed)
-            if score > best_score + 0.005 or (abs(score - best_score) <= 0.005 and len(trimmed) > 0 and len(trimmed) < len(best_text)):
-                best_text = trimmed
-                best_score = score
-                best_reason = "leading_fragment_removed" if is_leading else "trailing_fragment_removed"
-        if best_reason:
-            return best_text, best_reason
+            overlap_ok = False
+            if previous_final_text.endswith(fragment) or previous_selected_text.endswith(fragment):
+                overlap_ok = True
+            elif _LEADING_FRAGMENT_RE.match(fragment) and len(fragment) <= 3:
+                overlap_ok = True
+            if overlap_ok:
+                attempted = True
+                return trimmed, "leading_fragment_removed"
         return None
 
-    leading = _choose_best_trim(True)
+    def _trim_right_if_overlapping(text: str) -> tuple[str, str] | None:
+        nonlocal attempted, protected_prefix_prevented
+        if len(text) < 3:
+            return None
+        max_cut = min(6, len(text) - 1)
+        for cut in range(1, max_cut + 1):
+            fragment = text[-cut:]
+            trimmed = text[:-cut]
+            if len(trimmed) < 3:
+                continue
+            overlap_ok = False
+            if next_final_text.startswith(fragment) or next_selected_text.startswith(fragment):
+                overlap_ok = True
+            elif _TRAILING_FRAGMENT_RE.search(fragment) and len(fragment) <= 3:
+                overlap_ok = True
+            if overlap_ok:
+                attempted = True
+                return trimmed, "trailing_fragment_removed"
+        return None
+
+    leading = _trim_left_if_overlapping(result_text)
     if leading is not None:
         result_text, reason = leading
         reasons.append(reason)
         applied = True
-    trailing = _choose_best_trim(False)
+    trailing = _trim_right_if_overlapping(result_text)
     if trailing is not None:
         result_text, reason = trailing
         reasons.append(reason)
@@ -147,24 +199,35 @@ def _cleanup_boundary_fragments(final_text: str, apple_text: str, selected_sourc
         result_text = original_text
         reasons = []
         applied = False
+        reverted = True
 
-    unnatural = False
+    validation_failed = False
     if result_text:
-        if len(result_text) <= 2:
-            unnatural = True
-        if result_text[-1] in {"な", "で", "と", "そ", "よ", "ね"} and len(result_text) <= 10:
-            unnatural = True
+        if any(result_text.startswith(prefix) for prefix in _LEAN_VALIDATION_PREFIXES):
+            validation_failed = True
+        if any(result_text.endswith(suffix) for suffix in _LEAN_VALIDATION_SUFFIXES):
+            validation_failed = True
         if _LEADING_FRAGMENT_RE.match(result_text[:4]):
-            unnatural = True
+            validation_failed = True
         if _TRAILING_FRAGMENT_RE.search(result_text[-4:]):
-            unnatural = True
+            validation_failed = True
+
+    if validation_failed:
+        result_text = original_text
+        reasons = []
+        applied = False
+        reverted = True
 
     return {
         "final_text_before_cleanup": original_text,
         "final_text_after_cleanup": result_text,
         "boundary_cleanup_applied": applied,
         "boundary_cleanup_reason": reasons,
-        "boundary_cleanup_needs_review": unnatural,
+        "boundary_cleanup_attempted": attempted,
+        "boundary_cleanup_reverted": reverted,
+        "cleanup_validation_failed": validation_failed,
+        "protected_prefix_prevented_cleanup": protected_prefix_prevented,
+        "boundary_cleanup_needs_review": validation_failed,
     }
 
 
@@ -195,7 +258,7 @@ def select_final_candidates(
     previous_end: float | None = None
     risky_calls = 0
     unit_map = {u.sentence_id: u for u in sentence_units}
-    for segment in block_rows:
+    for idx, segment in enumerate(block_rows):
         candidate_rows = {source: segment[source] for source in ("qwen", "apple", "nemotron", "whisper")}
         best_source, deterministic = _deterministic_selection(candidate_rows, segment)
         selected_source = deterministic["selected_source"]
@@ -259,7 +322,25 @@ def select_final_candidates(
                 review_reason = merge_review_reasons(review_reason, [failure_reason])
 
         candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
-        cleanup = _cleanup_boundary_fragments(final_text, candidate_summary.get("apple", ""), selected_source)
+        previous_final_text = final_blocks[-1]["final_text_after_cleanup"] if final_blocks else ""
+        previous_selected_text = final_blocks[-1]["candidate_summary"].get(final_blocks[-1]["selected_source"], "") if final_blocks else ""
+        next_segment = block_rows[idx + 1] if idx + 1 < len(block_rows) else None
+        next_selected_text = ""
+        next_final_text = ""
+        if next_segment is not None:
+            next_candidate_rows = {source: next_segment[source] for source in ("qwen", "apple", "nemotron", "whisper")}
+            next_source, _ = _deterministic_selection(next_candidate_rows, next_segment)
+            next_selected_text = next_candidate_rows.get(next_source, {}).get("text", "")
+            next_final_text = next_selected_text
+        cleanup = _cleanup_boundary_fragments(
+            final_text,
+            candidate_summary.get("apple", ""),
+            selected_source,
+            previous_final_text=previous_final_text,
+            previous_selected_text=previous_selected_text,
+            next_final_text=next_final_text,
+            next_selected_text=next_selected_text,
+        )
         final_text_before_cleanup = cleanup["final_text_before_cleanup"]
         final_text = cleanup["final_text_after_cleanup"]
         if cleanup["boundary_cleanup_applied"]:
@@ -291,6 +372,10 @@ def select_final_candidates(
             "final_text_after_cleanup": final_text,
             "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
             "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
+            "boundary_cleanup_attempted": bool(cleanup.get("boundary_cleanup_attempted")),
+            "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
+            "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
+            "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
             "llm_used": bool(should_call),
             "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
             "selection_notes": llm_decision.notes if llm_decision is not None else "",
@@ -318,6 +403,10 @@ def select_final_candidates(
                     "final_text_after_cleanup": final_text,
                     "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
                     "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
+                    "boundary_cleanup_attempted": bool(cleanup.get("boundary_cleanup_attempted")),
+                    "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
+                    "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
+                    "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
                     "llm_used": bool(should_call),
                     "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
                     "selection_notes": llm_decision.notes if llm_decision is not None else "",
@@ -344,6 +433,10 @@ def select_final_candidates(
                     "final_text_after_cleanup": final_text,
                     "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
                     "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
+                    "boundary_cleanup_attempted": bool(cleanup.get("boundary_cleanup_attempted")),
+                    "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
+                    "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
+                    "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
                 }
             )
 
