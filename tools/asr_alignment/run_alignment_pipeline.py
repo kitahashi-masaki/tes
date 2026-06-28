@@ -683,11 +683,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         short_response_period=args.short_response_period,
     )
     summary["block_summary"] = block_summary
+    summary.update(block_summary)
     summary["normalized_summary"] = normalized_summary
     summary["alignment_text_used_for_text_score"] = True
     summary["boundary_text_used_for_main_text_score"] = False
     summary["boundary_hints_used_for_boundary_eval"] = bool(summary.get("boundary_hint_used_in_candidate_boundary_eval"))
     summary["punctuation_hard_matched_as_normal_chars"] = False
+    summary["parallel_enabled"] = not args.no_parallel
+    summary["source_level_boundary_hints_available_by_source"] = {"apple": True, "qwen": False, "nemotron": False, "whisper": False}
+    summary["candidate_level_boundary_hints_available_by_source"] = {"apple": True, "qwen": True, "nemotron": True, "whisper": True}
+    summary["boundary_hints_generated_before_candidate_extraction_by_source"] = {"apple": True, "qwen": False, "nemotron": False, "whisper": False}
+    summary["boundary_hints_generated_after_candidate_extraction_by_source"] = {"apple": False, "qwen": True, "nemotron": True, "whisper": True}
     review_sample_rows = _build_review_sample_rows(normalized_rows)
     review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")

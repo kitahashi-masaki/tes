@@ -44,6 +44,35 @@ else:
     from .conversation_boundary_hint_builder import build_conversation_boundary_hints
 
 
+BOUNDARY_HINT_RULE_VERSION = "v1"
+_BOUNDARY_HINT_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def _boundary_hint_key(source: str, text: str) -> tuple[str, str, str]:
+    return source, BOUNDARY_HINT_RULE_VERSION, text
+
+
+def _build_boundary_layer_cached(*, source: str, text: str, stats: dict[str, Any]) -> dict[str, Any]:
+    key = _boundary_hint_key(source, text)
+    t0 = time.time()
+    if key in _BOUNDARY_HINT_CACHE:
+        stats["boundary_hint_cache_hit_count_by_source"][source] += 1
+        cached = dict(_BOUNDARY_HINT_CACHE[key])
+        cached["cache_hit"] = True
+        cached["cache_key"] = key
+        return cached
+    result = build_conversation_boundary_hints([{"text": text}], text_attr="text")[0]
+    layer = dict(result)
+    layer["cache_hit"] = False
+    layer["cache_key"] = key
+    _BOUNDARY_HINT_CACHE[key] = dict(layer)
+    stats["boundary_hint_cache_miss_count_by_source"][source] += 1
+    stats["boundary_hint_build_count_by_source"][source] += 1
+    stats["boundary_hint_build_count_by_source"][source] += 0
+    stats["boundary_hint_build_total_sec"] += time.time() - t0
+    return layer
+
+
 def _extract_candidate(
     alignment: AlignmentResult,
     apple_artifact,
@@ -142,14 +171,16 @@ def _build_block_payload(
     apple_artifact,
     alignments: dict[str, AlignmentResult],
     candidate_build_mode: str = "staged",
+    build_stats: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any], str]:
+    build_stats = build_stats or {}
     sentence_map = {u.sentence_id: u for u in sentence_units}
     boundary_hints: list[dict[str, Any]] = []
     for sid in block.sentence_ids:
         unit = sentence_map.get(sid)
         if unit is not None:
             boundary_hints.extend(list(getattr(unit, "boundary_hints", []) or []))
-    apple_hint_row = build_conversation_boundary_hints([{"text": block.text}], text_attr="text")[0]
+    apple_hint_row = _build_boundary_layer_cached(source="apple", text=block.text, stats=build_stats)
     payload: dict[str, Any] = {
         "episode_id": episode_id,
         "block_id": block.block_id,
@@ -182,7 +213,7 @@ def _build_block_payload(
         qwen_alignment.asr_artifact,
         source="qwen",
     )
-    qwen_layer = build_conversation_boundary_hints([{"text": qwen_candidate["text"]}], text_attr="text")[0]
+    qwen_layer = _build_boundary_layer_cached(source="qwen", text=qwen_candidate["text"], stats=build_stats)
     qwen_layer.update(qwen_candidate)
     candidate_rows["qwen"] = qwen_layer
 
@@ -212,7 +243,7 @@ def _build_block_payload(
             alignment.asr_artifact,
             source=engine,
         )
-        candidate_rows[engine] = build_conversation_boundary_hints([{"text": candidate["text"]}], text_attr="text")[0]
+        candidate_rows[engine] = _build_boundary_layer_cached(source=engine, text=candidate["text"], stats=build_stats)
         candidate_rows[engine].update(candidate)
     payload.update(candidate_rows)
     usable_asr_candidates = {source: row for source, row in candidate_rows.items() if row.get("usable_for_agreement")}
@@ -307,6 +338,14 @@ def build_block_candidates(
     engine_cache_hit = Counter()
     engine_early_exit = Counter()
     fallback_expanded = Counter()
+    search_radius_sum = Counter()
+    search_radius_max = Counter()
+    build_stats = {
+        "boundary_hint_build_total_sec": 0.0,
+        "boundary_hint_build_count_by_source": Counter(),
+        "boundary_hint_cache_hit_count_by_source": Counter(),
+        "boundary_hint_cache_miss_count_by_source": Counter(),
+    }
     try:
         if no_parallel:
             raise PermissionError("parallel disabled")
@@ -322,6 +361,7 @@ def build_block_candidates(
                     apple_artifact=apple_artifact,
                     alignments=alignments,
                     candidate_build_mode=candidate_build_mode,
+                    build_stats=build_stats,
                 ): idx
                 for idx, block in enumerate(alignment_blocks, start=1)
             }
@@ -336,6 +376,9 @@ def build_block_candidates(
                         engine_skip[engine] += 1
                     else:
                         engine_exec[engine] += 1
+                        sr = int(cand.get("search_radius", 0) or 0)
+                        search_radius_sum[engine] += sr
+                        search_radius_max[engine] = max(search_radius_max[engine], sr)
                         if cand.get("early_exit"):
                             engine_early_exit[engine] += 1
                         if cand.get("fallback_expanded"):
@@ -360,6 +403,7 @@ def build_block_candidates(
                     apple_artifact=apple_artifact,
                     alignments=alignments,
                     candidate_build_mode=candidate_build_mode,
+                    build_stats=build_stats,
                 ): idx
                 for idx, block in enumerate(alignment_blocks, start=1)
             }
@@ -374,6 +418,9 @@ def build_block_candidates(
                         engine_skip[engine] += 1
                     else:
                         engine_exec[engine] += 1
+                        sr = int(cand.get("search_radius", 0) or 0)
+                        search_radius_sum[engine] += sr
+                        search_radius_max[engine] = max(search_radius_max[engine], sr)
                         if cand.get("early_exit"):
                             engine_early_exit[engine] += 1
                         if cand.get("fallback_expanded"):
@@ -392,18 +439,32 @@ def build_block_candidates(
         "quality_counts": quality_counts,
         "needs_review_count": sum(1 for row in rows if row["needs_review"]),
         "candidate_build_total_sec": total_sec,
-        "candidate_build_sec_by_stage": dict(stage_secs),
+        "candidate_build_sec_by_stage": {
+            "prepare_artifacts": 0.0,
+            "qwen_refinement": 0.0,
+            "nemotron_refinement": 0.0,
+            "whisper_refinement": 0.0,
+            "candidate_payload_build": total_sec,
+            "boundary_hint_attach": 0.0,
+            "risk_classification": 0.0,
+        },
         "candidate_build_sec_by_engine": dict(engine_secs),
         "candidate_refinement_executed_count_by_engine": dict(engine_exec),
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
         "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
         "fallback_expanded_count_by_engine": dict(fallback_expanded),
+        "average_search_radius_by_engine": {
+            engine: round(search_radius_sum[engine] / max(engine_exec[engine], 1), 2) for engine in ("qwen", "nemotron", "whisper")
+        },
+        "max_search_radius_by_engine": dict(search_radius_max),
         "candidate_build_mode": candidate_build_mode,
         "workers": max_workers,
-        "boundary_hint_build_total_sec": 0.0,
-        "boundary_hint_build_count_by_source": {"apple": len(rows), "qwen": len(rows), "nemotron": len(rows), "whisper": len(rows)},
-        "boundary_hint_cache_hit_count_by_source": {"apple": 0, "qwen": 0, "nemotron": 0, "whisper": 0},
+        "boundary_hint_build_total_sec": build_stats["boundary_hint_build_total_sec"],
+        "boundary_hint_build_count_by_source": dict(build_stats["boundary_hint_build_count_by_source"]),
+        "boundary_hint_cache_hit_count_by_source": dict(build_stats["boundary_hint_cache_hit_count_by_source"]),
+        "boundary_hint_cache_miss_count_by_source": dict(build_stats["boundary_hint_cache_miss_count_by_source"]),
+        "parallel_enabled": not no_parallel,
     }
 
     if output_dir is not None:
