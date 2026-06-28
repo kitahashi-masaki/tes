@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -114,7 +115,22 @@ def select_final_candidates(
             stats["llm_used"] = True
             stats["llm_call_count"] += 1
             risky_calls += 1
+            print(
+                f"[llm] start episode={episode_id} block_id={segment.get('block_id')} "
+                f"segment_id={segment.get('segment_id')} quality={segment.get('alignment_quality')} "
+                f"diff={segment.get('qwen_apple_difference_type')} flags={segment.get('risk_flags', [])}",
+                flush=True,
+            )
+            t0 = time.time()
             llm_decision = llm_client.choose(segment, episode_id=episode_id)
+            dt = time.time() - t0
+            print(
+                f"[llm] end episode={episode_id} block_id={segment.get('block_id')} "
+                f"segment_id={segment.get('segment_id')} success={llm_decision.success} "
+                f"cached={llm_decision.cached} seconds={dt:.2f} "
+                f"error={llm_decision.error or ''}",
+                flush=True,
+            )
             if llm_decision.cached:
                 stats["llm_cache_hit_count"] += 1
             if llm_decision.success:
@@ -139,15 +155,16 @@ def select_final_candidates(
                 review_reason = merge_review_reasons(review_reason, llm_decision.review_reason, [llm_decision.notes] if llm_decision.notes else [])
             else:
                 stats["llm_failure_count"] += 1
-                review_reason = merge_review_reasons(review_reason, [llm_decision.error or "llm_failed"])
+                failure_reason = llm_decision.error or "llm_failed"
+                review_reason = merge_review_reasons(review_reason, [failure_reason])
 
-        time = dict(segment["time"])
-        time["start_sec"], time["end_sec"] = _maybe_clamp_time(
-            float(time["start_sec"]),
-            float(time["end_sec"]),
+        segment_time = dict(segment["time"])
+        segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
+            float(segment_time["start_sec"]),
+            float(segment_time["end_sec"]),
             previous_end,
         )
-        previous_end = time["end_sec"]
+        previous_end = segment_time["end_sec"]
         candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
         for sentence_id in segment["sentence_ids"]:
             unit = unit_map[sentence_id]
@@ -169,6 +186,7 @@ def select_final_candidates(
                     "llm_used": bool(should_call),
                     "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
                     "selection_notes": llm_decision.notes if llm_decision is not None else "",
+                    "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
         if needs_review:
@@ -177,12 +195,13 @@ def select_final_candidates(
                     "episode_id": episode_id,
                     "block_id": segment["block_id"],
                     "sentence_ids": segment["sentence_ids"],
-                    "time": time,
+                    "time": segment_time,
                     "needs_review": needs_review,
                     "review_reason": review_reason,
                     "alignment_quality": segment.get("alignment_quality"),
                     "risk_flags": segment.get("risk_flags", []),
                     "candidate_summary": candidate_summary,
+                    "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,11 @@ def align_engine_to_apple(
     apple_artifact,
     output_dir: Path | None = None,
 ) -> AlignmentResult:
+    t0 = time.time()
+    print(
+        f"[align] start episode={episode_id} engine={engine} source={source_text_file.name}",
+        flush=True,
+    )
     asr_text = source_text_file.read_text(encoding="utf-8")
     asr_artifact = build_text_artifact(asr_text)
     anchors, apple_to_asr_map, asr_to_apple_map, global_score, coverage = build_mapping_from_equal_blocks(
@@ -54,6 +60,11 @@ def align_engine_to_apple(
         asr_to_apple_map=asr_to_apple_map,
         apple_artifact=apple_artifact,
         asr_artifact=asr_artifact,
+    )
+    print(
+        f"[align] end episode={episode_id} engine={engine} score={global_score:.3f} "
+        f"coverage={coverage:.3f} seconds={time.time() - t0:.2f}",
+        flush=True,
     )
 
     if output_dir is not None:
@@ -94,4 +105,3 @@ def align_engine_to_apple(
             encoding="utf-8",
         )
     return alignment
-

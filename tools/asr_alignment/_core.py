@@ -1167,7 +1167,19 @@ def parse_llm_response(raw_text: str) -> dict[str, Any]:
     if raw_text.startswith("```"):
         raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
         raw_text = re.sub(r"\s*```$", "", raw_text)
-    return json.loads(raw_text)
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        start_candidates = [idx for idx in (raw_text.find("{"), raw_text.find("[")) if idx != -1]
+        if not start_candidates:
+            raise
+        start = min(start_candidates)
+        end_candidates = [raw_text.rfind("}"), raw_text.rfind("]")]
+        end = max(end_candidates)
+        if end <= start:
+            raise
+        snippet = raw_text[start : end + 1]
+        return json.loads(snippet)
 
 
 def extract_chat_completion_text(payload: dict[str, Any]) -> str:

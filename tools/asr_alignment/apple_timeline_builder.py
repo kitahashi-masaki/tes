@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,8 @@ def _load_snapshot_texts(raw_volatile_zip_path: Path | None) -> list[str]:
 
 
 def build_apple_timeline(input_dir: Path, *, episode_prefix: str | None = None, output_dir: Path | None = None) -> dict[str, Any]:
+    t0 = time.time()
+    print(f"[apple] start input_dir={input_dir} episode_prefix={episode_prefix}", flush=True)
     files = load_episode_files(input_dir, episode_prefix)
     final_json_path = _find_path(files, ".MacOS-SpeechAnalyzer.json")
     final_txt_path = _find_path(files, ".MacOS-SpeechAnalyzer.txt")
@@ -226,6 +229,10 @@ def build_apple_timeline(input_dir: Path, *, episode_prefix: str | None = None, 
             "alignment_blocks": [dataclasses.asdict(block) for block in blocks],
         }
         (output_dir / "normalized" / f"{episode_id}.apple_timeline.json").write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(
+        f"[apple] end episode={episode_id} sentence_units={len(sentence_units)} blocks={len(blocks)} "
+        f"text_len={len(full_text)} seconds={time.time() - t0:.2f}",
+        flush=True,
+    )
 
     return timeline
-

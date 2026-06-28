@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -13,19 +14,29 @@ if __package__ is None or __package__ == "":
     from tools.asr_alignment._core import (  # type: ignore
         AppleSentenceUnit,
         AlignmentBlock,
+        AlignmentResult,
+        NormEntry,
+        TextArtifact,
         ensure_dir,
         load_episode_files,
+        load_jsonl,
         nfc_text,
+        read_json_from_path,
+        build_text_artifact,
     )
     from tools.asr_alignment.apple_timeline_builder import build_apple_timeline  # type: ignore
     from tools.asr_alignment.flat_text_aligner import align_engine_to_apple  # type: ignore
     from tools.asr_alignment.final_candidate_selector import select_final_candidates  # type: ignore
+    from tools.asr_alignment.llm_client import LLMClient  # type: ignore
+    from tools.asr_alignment.normalize_fusion_flags import normalize_file  # type: ignore
     from tools.asr_alignment.segment_candidate_builder import build_block_candidates  # type: ignore
 else:
-    from ._core import AppleSentenceUnit, AlignmentBlock, ensure_dir, load_episode_files, nfc_text
+    from ._core import AppleSentenceUnit, AlignmentBlock, AlignmentResult, NormEntry, TextArtifact, ensure_dir, load_episode_files, load_jsonl, nfc_text, read_json_from_path, build_text_artifact
     from .apple_timeline_builder import build_apple_timeline
     from .flat_text_aligner import align_engine_to_apple
     from .final_candidate_selector import select_final_candidates
+    from .llm_client import LLMClient
+    from .normalize_fusion_flags import normalize_file
     from .segment_candidate_builder import build_block_candidates
 
 
@@ -59,6 +70,70 @@ def _discover_episode_prefix(input_dir: Path, episode_prefix: str | None) -> str
 def _force_clean_output(output_dir: Path) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
+
+
+def _load_alignment_result_from_files(output_dir: Path, episode_id: str, engine: str) -> AlignmentResult:
+    summary = read_json_from_path(output_dir / "alignment" / f"{episode_id}.{engine}_alignment.json")
+    normalized = read_json_from_path(output_dir / "normalized" / f"{episode_id}.{engine}.normalized.json")
+    char_map = [
+        NormEntry(
+            norm_index=int(entry["norm_index"]),
+            raw_index=int(entry["raw_index"]),
+            raw_char=str(entry["raw_char"]),
+            norm_char=str(entry["norm_char"]),
+        )
+        for entry in normalized.get("char_map", [])
+    ]
+    asr_artifact = TextArtifact(
+        raw_text=str(normalized.get("raw_text", "")),
+        display_norm_text=str(normalized.get("display_norm_text", "")),
+        match_norm_text=str(normalized.get("match_norm_text", "")),
+        entries=char_map,
+    )
+    apple_to_asr_map = list(summary.get("apple_to_asr_map") or normalized.get("apple_to_asr_map") or [])
+    asr_to_apple_map = list(summary.get("asr_to_apple_map") or normalized.get("asr_to_apple_map") or [])
+    # The saved alignment JSON does not contain artifacts, so rebuild them from the current outputs.
+    return AlignmentResult(
+        episode_id=summary["episode_id"],
+        engine=summary["engine"],
+        source_text_file=str(summary["source_text_file"]),
+        apple_text_length=int(summary["apple_text_length"]),
+        asr_text_length=int(summary["asr_text_length"]),
+        normalized_apple_text_length=int(summary["normalized_apple_text_length"]),
+        normalized_asr_text_length=int(summary["normalized_asr_text_length"]),
+        global_alignment_score=float(summary["global_alignment_score"]),
+        coverage_ratio=float(summary["coverage_ratio"]),
+        anchors=summary.get("anchors") or [],
+        apple_to_asr_map=[float(x) for x in apple_to_asr_map],
+        asr_to_apple_map=[float(x) for x in asr_to_apple_map],
+        apple_artifact=build_text_artifact(read_json_from_path(output_dir / "normalized" / f"{episode_id}.apple_timeline.json")["apple_stable_full_text"]),
+        asr_artifact=asr_artifact,
+    )
+
+
+def _load_resume_bundle(output_dir: Path) -> tuple[str, dict[str, Any], list[AppleSentenceUnit], list[AlignmentBlock], dict[str, AlignmentResult], list[dict[str, Any]], dict[str, Any]]:
+    manifest_paths = sorted((output_dir / "normalized").glob("*.manifest.json"))
+    if not manifest_paths:
+        raise FileNotFoundError(f"missing resume manifest in {output_dir / 'normalized'}")
+    normalized_manifest = read_json_from_path(manifest_paths[0])
+    episode_id = str(normalized_manifest["episode_id"])
+    apple_timeline = read_json_from_path(output_dir / "normalized" / f"{episode_id}.apple_timeline.json")
+    sentence_units = [AppleSentenceUnit(**row) for row in apple_timeline["apple_sentence_units"]]
+    blocks = [AlignmentBlock(**row) for row in apple_timeline["alignment_blocks"]]
+    alignments = {
+        engine: _load_alignment_result_from_files(output_dir, episode_id, engine)
+        for engine in ("qwen", "nemotron", "whisper")
+    }
+    block_rows = load_jsonl(output_dir / "fusion" / f"{episode_id}.normalized_block_candidates.jsonl")
+    validation = {
+        "sentence": __import__("tools.asr_alignment._core", fromlist=["validate_sentence_units"]).validate_sentence_units(
+            apple_timeline["apple_stable_full_text"], sentence_units
+        ),
+        "block": __import__("tools.asr_alignment._core", fromlist=["validate_alignment_blocks"]).validate_alignment_blocks(
+            apple_timeline["apple_stable_full_text"], sentence_units, blocks
+        ),
+    }
+    return episode_id, apple_timeline, sentence_units, blocks, alignments, block_rows, validation
 
 
 def _build_summary(
@@ -230,11 +305,92 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("## block サンプル")
     for row in summary["sample_blocks"]:
         lines.append(f"- {row['block_id']} {row['alignment_quality']} review={row['needs_review']} text={row['apple']['text'][:80]}")
+    if summary.get("review_sample_path"):
+        lines.append("")
+        lines.append("## review サンプル")
+        lines.append(f"- 全文サンプル: {summary['review_sample_path']}")
     lines.append("")
     return "\n".join(lines)
 
 
+def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
+    review_rows = [row for row in block_rows if row.get("needs_review")]
+    sample_rows: list[dict[str, Any]] = []
+    for row in review_rows[:limit]:
+        sample_rows.append(
+            {
+                "episode_id": row.get("episode_id"),
+                "block_id": row.get("block_id"),
+                "segment_id": row.get("segment_id"),
+                "alignment_quality": row.get("alignment_quality"),
+                "needs_review": row.get("needs_review"),
+                "needs_review_reason": row.get("needs_review_reason", []),
+                "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
+                "qwen_apple_similarity": row.get("qwen_apple_similarity"),
+                "risk_flags": row.get("risk_flags", []),
+                "apple_text": row.get("apple", {}).get("text", ""),
+                "candidate_texts": {
+                    engine: row.get(engine, {}).get("text", "")
+                    for engine in ("qwen", "nemotron", "whisper")
+                    if isinstance(row.get(engine), dict)
+                },
+            }
+        )
+    return sample_rows
+
+
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+    t0 = time.time()
+    if args.resume_output_dir:
+        output_dir = Path(args.resume_output_dir).expanduser().resolve()
+        print(f"[pipeline] resume from output_dir={output_dir}", flush=True)
+        episode_id, apple_timeline, sentence_units, blocks, alignments, block_rows, validation = _load_resume_bundle(output_dir)
+        source_files = {Path(path).name: Path(path) for path in apple_timeline.get("source_files", {}).values() if path}
+        llm_client = None
+        if args.use_llm:
+            print("[pipeline] llm client init", flush=True)
+            llm_client = LLMClient(
+                endpoint=args.llm_endpoint,
+                model=args.llm_model,
+                api_key=args.llm_api_key,
+                cache_dir=output_dir / "llm_cache",
+            )
+        print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
+        final_rows, review_rows, llm_stats = select_final_candidates(
+            episode_id=episode_id,
+            block_rows=block_rows,
+            sentence_units=sentence_units,
+            llm_client=llm_client,
+            use_llm=args.use_llm,
+            llm_only_risky=args.llm_only_risky,
+            llm_max_segments=args.llm_max_segments,
+            output_dir=output_dir,
+        )
+        print(
+            f"[pipeline] final selection end final_rows={len(final_rows)} review_rows={len(review_rows)} "
+            f"llm_used={llm_stats.get('llm_used')}",
+            flush=True,
+        )
+        summary = _build_summary(
+            episode_id=episode_id,
+            input_dir=Path(apple_timeline.get("source_files", {}).get("final_json", output_dir)),
+            source_files=source_files,
+            apple_timeline=apple_timeline,
+            alignments=alignments,
+            block_rows=block_rows,
+            final_rows=final_rows,
+            review_rows=review_rows,
+            llm_stats=llm_stats,
+            validation=validation,
+            output_dir=output_dir,
+        )
+        summary["normalized_summary"] = read_json_from_path(output_dir / "reports" / f"{episode_id}.normalized_summary.json") if (output_dir / "reports" / f"{episode_id}.normalized_summary.json").exists() else {}
+        summary["review_sample_path"] = str(output_dir / "reports" / f"{episode_id}.review_sample_blocks.json")
+        summary["review_sample_count"] = len(review_rows)
+        (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
+        print(f"[pipeline] end seconds={time.time() - t0:.2f}", flush=True)
+        return summary
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     if output_dir == input_dir or input_dir in output_dir.parents or output_dir in input_dir.parents:
@@ -247,10 +403,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     ensure_dir(output_dir)
     for name in ("normalized", "apple_timeline", "alignment", "aligned_segments", "fusion", "llm_cache", "reports"):
         ensure_dir(output_dir / name)
+    print(f"[pipeline] start episode_prefix={episode_prefix} output_dir={output_dir}", flush=True)
 
     source_files = load_episode_files(input_dir, episode_prefix)
+    print(f"[pipeline] files loaded count={len(source_files)}", flush=True)
     apple_timeline = build_apple_timeline(input_dir, episode_prefix=episode_prefix, output_dir=output_dir)
     episode_id = apple_timeline["episode_id"]
+    print(f"[pipeline] apple timeline built episode={episode_id}", flush=True)
     sentence_units = [AppleSentenceUnit(**row) for row in apple_timeline["apple_sentence_units"]]
     blocks = [AlignmentBlock(**row) for row in apple_timeline["alignment_blocks"]]
     validation = {
@@ -261,6 +420,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             apple_timeline["apple_stable_full_text"], sentence_units, blocks
         ),
     }
+    print(
+        f"[pipeline] validation sentence_units={len(sentence_units)} blocks={len(blocks)} "
+        f"very_short={validation['sentence']['very_short_sentence_count']}",
+        flush=True,
+    )
 
     apple_artifact = apple_timeline["apple_artifact"]
     alignments = {}
@@ -270,6 +434,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "whisper": _find_engine_file(source_files, ".whisper-small.txt"),
     }
     for engine, path in engine_files.items():
+        print(f"[pipeline] align start engine={engine} file={path.name}", flush=True)
         alignments[engine] = align_engine_to_apple(
             episode_id=episode_id,
             engine=engine,
@@ -277,7 +442,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             apple_artifact=apple_artifact,
             output_dir=output_dir,
         )
+        print(
+            f"[pipeline] align end engine={engine} score={alignments[engine].global_alignment_score:.3f} "
+            f"coverage={alignments[engine].coverage_ratio:.3f}",
+            flush=True,
+        )
 
+    print("[pipeline] build block candidates start", flush=True)
     block_rows, block_summary = build_block_candidates(
         episode_id=episode_id,
         alignment_blocks=blocks,
@@ -286,16 +457,43 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         alignments=alignments,
         output_dir=output_dir,
     )
+    print(f"[pipeline] build block candidates end count={len(block_rows)}", flush=True)
+    print("[pipeline] normalize flags start", flush=True)
+    normalized_rows, normalized_summary = normalize_file(
+        output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
+        output_dir,
+    )
+    print(
+        f"[pipeline] normalize flags end auto_accepted={normalized_summary.get('auto_accepted_count')} "
+        f"needs_review={normalized_summary.get('needs_review_count')}",
+        flush=True,
+    )
 
+    llm_client = None
+    if args.use_llm:
+        print("[pipeline] llm client init", flush=True)
+        llm_client = LLMClient(
+            endpoint=args.llm_endpoint,
+            model=args.llm_model,
+            api_key=args.llm_api_key,
+            cache_dir=output_dir / "llm_cache",
+        )
+
+    print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
     final_rows, review_rows, llm_stats = select_final_candidates(
         episode_id=episode_id,
-        block_rows=block_rows,
+        block_rows=normalized_rows,
         sentence_units=sentence_units,
-        llm_client=None,
-        use_llm=False,
+        llm_client=llm_client,
+        use_llm=args.use_llm,
         llm_only_risky=args.llm_only_risky,
         llm_max_segments=args.llm_max_segments,
         output_dir=output_dir,
+    )
+    print(
+        f"[pipeline] final selection end final_rows={len(final_rows)} review_rows={len(review_rows)} "
+        f"llm_used={llm_stats.get('llm_used')}",
+        flush=True,
     )
 
     summary = _build_summary(
@@ -304,7 +502,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         source_files=source_files,
         apple_timeline=apple_timeline,
         alignments=alignments,
-        block_rows=block_rows,
+        block_rows=normalized_rows,
         final_rows=final_rows,
         review_rows=review_rows,
         llm_stats=llm_stats,
@@ -312,12 +510,19 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=output_dir,
     )
     summary["block_summary"] = block_summary
+    summary["normalized_summary"] = normalized_summary
+    review_sample_rows = _build_review_sample_rows(normalized_rows)
+    review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
+    review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary["review_sample_path"] = str(review_sample_path)
+    summary["review_sample_count"] = len(review_sample_rows)
     (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
     (output_dir / "normalized" / f"{episode_id}.manifest.json").write_text(
         json.dumps({"episode_id": episode_id, "input_dir": str(input_dir), "output_dir": str(output_dir), "episode_prefix": episode_prefix, "files": sorted(str(path) for path in source_files.values())}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    print(f"[pipeline] end seconds={time.time() - t0:.2f}", flush=True)
     return summary
 
 
@@ -325,6 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="既存 ASR 出力を Apple SpeechAnalyzer の時刻軸へ後付け整列します。")
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--resume-output-dir", default=None)
     parser.add_argument("--episode-prefix", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--use-llm", action="store_true")

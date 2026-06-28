@@ -57,9 +57,18 @@ class LLMClient:
         if only_risky and not segment_payload.get("needs_review"):
             return False
         quality = segment_payload.get("alignment_quality")
+        difference_type = segment_payload.get("qwen_apple_difference_type")
+        if quality == "E":
+            return True
+        if difference_type in {"critical", "semantic"}:
+            return True
+        if segment_payload.get("numeric_disagreement"):
+            return True
+        if segment_payload.get("needs_review"):
+            return True
         agreement = float(segment_payload.get("candidate_agreement_score", 1.0))
         flags = segment_payload.get("risk_flags") or []
-        return quality in {"B", "C", "D", "E"} or agreement < 0.85 or bool(flags)
+        return quality in {"B", "C", "D"} and (agreement < 0.85 or bool(flags))
 
     def _build_prompt(self, segment_payload: dict[str, Any]) -> dict[str, Any]:
         candidate_summary = {
@@ -76,7 +85,9 @@ class LLMClient:
             "必要なら、候補内の一部表記だけを組み合わせてもよいですが、候補にない語は追加禁止です。\n"
             "数字・固有名詞・専門語は特に慎重に扱ってください。\n"
             "不確実な場合は needs_review=true にしてください。\n"
-            "出力は必ずJSONのみとしてください。\n\n"
+            "出力は必ずJSONのみとしてください。\n"
+            "JSONは次のキーだけを含めてください: selected_source, final_text, confidence, needs_review, review_reason, notes\n"
+            "markdown, 補足説明, コードフェンスは禁止です。\n\n"
             f"segment_id: {segment_payload['segment_id']}\n"
             f"time: {segment_payload['time']}\n"
             f"risk_flags: {segment_payload.get('risk_flags', [])}\n"
@@ -87,8 +98,8 @@ class LLMClient:
         return {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.15,
-            "max_tokens": 256,
+            "temperature": 0.0,
+            "max_tokens": 320,
             "stream": False,
         }
 
@@ -116,6 +127,10 @@ class LLMClient:
                 notes=str(payload.get("notes") or ""),
             )
 
+        atomic_write_text(
+            cache_file,
+            json.dumps({"request": prompt_payload, "status": "pending"}, ensure_ascii=False, indent=2),
+        )
         try:
             response = http_post_json(self.endpoint, prompt_payload, api_key=self.api_key, timeout=self.timeout)
             content = extract_chat_completion_text(response)
@@ -146,4 +161,8 @@ class LLMClient:
                 notes=str(parsed.get("notes") or ""),
             )
         except Exception as exc:  # noqa: BLE001
+            atomic_write_text(
+                cache_file,
+                json.dumps({"request": prompt_payload, "error": str(exc)}, ensure_ascii=False, indent=2),
+            )
             return LLMDecision(success=False, cached=False, error=str(exc))
