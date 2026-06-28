@@ -70,6 +70,14 @@ def _maybe_clamp_time(start: float, end: float, previous_end: float | None) -> t
     return start, end
 
 
+def _normalize_review_reason(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
+
+
 def select_final_candidates(
     *,
     episode_id: str,
@@ -80,8 +88,9 @@ def select_final_candidates(
     llm_only_risky: bool = False,
     llm_max_segments: int = 200,
     output_dir: Path | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     final_rows: list[dict[str, Any]] = []
+    final_blocks: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
     stats = {
         "llm_used": False,
@@ -142,17 +151,18 @@ def select_final_candidates(
                     confidence = llm_decision.confidence if llm_decision.confidence is not None else confidence
                     selection_method = "llm_candidate_selection"
                 if llm_decision.final_text:
-                    llm_text = str(llm_decision.final_text)
-                    if segment_similarity_score(llm_text, final_text) < 0.95:
+                    llm_text = str(llm_decision.final_text).strip()
+                    if llm_text and segment_similarity_score(llm_text, final_text) < 0.95:
                         stats["llm_changed_final_text_count"] += 1
-                    final_text = candidate_rows.get(selected_source, {}).get("text", final_text)
+                    if llm_text:
+                        final_text = llm_text
                 if llm_decision.needs_review is not None:
                     if llm_decision.needs_review and not needs_review:
                         stats["llm_changed_needs_review_true_count"] += 1
                     if not llm_decision.needs_review and needs_review:
                         stats["llm_changed_needs_review_false_count"] += 1
                     needs_review = bool(llm_decision.needs_review)
-                review_reason = merge_review_reasons(review_reason, llm_decision.review_reason, [llm_decision.notes] if llm_decision.notes else [])
+                review_reason = merge_review_reasons(review_reason, _normalize_review_reason(llm_decision.review_reason), [llm_decision.notes] if llm_decision.notes else [])
             else:
                 stats["llm_failure_count"] += 1
                 failure_reason = llm_decision.error or "llm_failed"
@@ -166,6 +176,24 @@ def select_final_candidates(
         )
         previous_end = segment_time["end_sec"]
         candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
+        block_final = {
+            "episode_id": episode_id,
+            "block_id": segment["block_id"],
+            "sentence_ids": segment["sentence_ids"],
+            "time": segment_time,
+            "final_text": final_text,
+            "selected_source": selected_source,
+            "selection_method": selection_method,
+            "confidence": float(confidence),
+            "needs_review": needs_review,
+            "review_reason": review_reason,
+            "candidate_summary": candidate_summary,
+            "llm_used": bool(should_call),
+            "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
+            "selection_notes": llm_decision.notes if llm_decision is not None else "",
+            "llm_error": llm_decision.error if llm_decision is not None else "",
+        }
+        final_blocks.append(block_final)
         for sentence_id in segment["sentence_ids"]:
             unit = unit_map[sentence_id]
             final_rows.append(
@@ -176,7 +204,7 @@ def select_final_candidates(
                     "sentence_ids": segment["sentence_ids"],
                     "time": {"start_sec": unit.start_sec, "end_sec": unit.end_sec},
                     "apple_text": unit.text,
-                    "final_text": unit.text,
+                    "final_text": final_text,
                     "selected_source": selected_source,
                     "selection_method": selection_method,
                     "confidence": float(confidence),
@@ -201,19 +229,38 @@ def select_final_candidates(
                     "alignment_quality": segment.get("alignment_quality"),
                     "risk_flags": segment.get("risk_flags", []),
                     "candidate_summary": candidate_summary,
+                    "final_text": final_text,
+                    "selected_source": selected_source,
+                    "confidence": float(confidence),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
 
     if output_dir is not None:
         ensure_dir(output_dir / "fusion")
+        save_jsonl(output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl", final_blocks)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.final_segments.jsonl", final_rows)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.review_queue.jsonl", review_rows)
         transcript_lines = [f"# {episode_id}", ""]
-        for row in final_rows:
+        for row in final_blocks:
             start = row["time"]["start_sec"]
             end = row["time"]["end_sec"]
             transcript_lines.append(f"- [{start:.2f}-{end:.2f}] {row['final_text']}")
         (output_dir / "fusion" / f"{episode_id}.final_transcript.md").write_text("\n".join(transcript_lines) + "\n", encoding="utf-8")
+        sentence_timeline_lines = []
+        for row in final_rows:
+            sentence_timeline_lines.append(
+                json.dumps(
+                    {
+                        "episode_id": row["episode_id"],
+                        "sentence_id": row["sentence_id"],
+                        "block_id": row["block_id"],
+                        "time": row["time"],
+                        "apple_text": row["apple_text"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        (output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl").write_text("\n".join(sentence_timeline_lines) + ("\n" if sentence_timeline_lines else ""), encoding="utf-8")
 
-    return final_rows, review_rows, stats
+    return final_blocks, final_rows, review_rows, stats

@@ -103,6 +103,14 @@ class LLMClient:
             "stream": False,
         }
 
+    @staticmethod
+    def _normalize_review_reason(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return []
+
     def choose(self, segment_payload: dict[str, Any], *, episode_id: str) -> LLMDecision:
         prompt_payload = self._build_prompt(segment_payload)
         candidate_hash = hash_candidate_context(prompt_payload)
@@ -123,7 +131,7 @@ class LLMClient:
                 final_text=payload.get("final_text"),
                 confidence=float(payload.get("confidence")) if payload.get("confidence") is not None else None,
                 needs_review=payload.get("needs_review"),
-                review_reason=list(payload.get("review_reason") or []),
+                review_reason=self._normalize_review_reason(payload.get("review_reason")),
                 notes=str(payload.get("notes") or ""),
             )
 
@@ -157,7 +165,7 @@ class LLMClient:
                 final_text=str(parsed.get("final_text") or ""),
                 confidence=float(parsed.get("confidence")) if parsed.get("confidence") is not None else None,
                 needs_review=bool(parsed.get("needs_review")) if parsed.get("needs_review") is not None else None,
-                review_reason=list(parsed.get("review_reason") or []),
+                review_reason=self._normalize_review_reason(parsed.get("review_reason")),
                 notes=str(parsed.get("notes") or ""),
             )
         except Exception as exc:  # noqa: BLE001

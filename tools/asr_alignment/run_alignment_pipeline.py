@@ -144,6 +144,7 @@ def _build_summary(
     apple_timeline: dict[str, Any],
     alignments: dict[str, Any],
     block_rows: list[dict[str, Any]],
+    final_blocks: list[dict[str, Any]],
     final_rows: list[dict[str, Any]],
     review_rows: list[dict[str, Any]],
     llm_stats: dict[str, Any],
@@ -168,6 +169,12 @@ def _build_summary(
     refined_counts = Counter()
     unusable_counts = Counter()
     contamination_counts = Counter()
+    selected_source_counts = Counter()
+    selection_method_counts = Counter()
+    final_text_equals_apple_text_count = 0
+    selected_source_not_apple_final_equals_apple_count = 0
+    llm_called_block_count = 0
+    review_reason_char_split_count = 0
     for row in block_rows:
         risk_counts.update(row.get("risk_flags", []))
         for engine in ("qwen", "apple", "nemotron", "whisper"):
@@ -202,6 +209,19 @@ def _build_summary(
         if row.get("critical_term_disagreement"):
             critical_term_disagreement_count += 1
         usable_distribution[row.get("candidate_agreement_score", 0.0) >= 0.7] += 1
+    for block in final_blocks:
+        selected_source_counts[block.get("selected_source", "unknown")] += 1
+        selection_method_counts[block.get("selection_method", "unknown")] += 1
+        if block.get("llm_used"):
+            llm_called_block_count += 1
+        if str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
+            final_text_equals_apple_text_count += 1
+        if block.get("selected_source") != "apple" and str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
+            selected_source_not_apple_final_equals_apple_count += 1
+    for row in review_rows:
+        reasons = row.get("review_reason", [])
+        if isinstance(reasons, list) and reasons and all(len(str(reason)) == 1 for reason in reasons):
+            review_reason_char_split_count += 1
     sentence_units = apple_timeline["apple_sentence_units"]
     blocks = apple_timeline["alignment_blocks"]
     avg_sentences_per_block = round(sum(len(b["sentence_ids"]) for b in blocks) / max(len(blocks), 1), 2)
@@ -223,6 +243,14 @@ def _build_summary(
         "coverage_ratios": {engine: alignments[engine].coverage_ratio for engine in alignments},
         "alignment_quality_counts": dict(sorted(quality_counts.items())),
         "needs_review_count": sum(1 for row in block_rows if row["needs_review"]),
+        "final_block_count": len(final_blocks),
+        "final_sentence_timeline_count": len(final_rows),
+        "final_text_equals_apple_text_count": final_text_equals_apple_text_count,
+        "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
+        "selected_source_counts": dict(selected_source_counts),
+        "selection_method_counts": dict(selection_method_counts),
+        "llm_called_block_count": llm_called_block_count,
+        "review_reason_char_split_count": review_reason_char_split_count,
         "auto_accepted_count": auto_accepted_count,
         "auto_accepted_ratio": round(auto_accepted_count / max(len(block_rows), 1), 3),
         "risk_flag_counts": dict(risk_counts.most_common()),
@@ -356,7 +384,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 cache_dir=output_dir / "llm_cache",
             )
         print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
-        final_rows, review_rows, llm_stats = select_final_candidates(
+        final_blocks, final_rows, review_rows, llm_stats = select_final_candidates(
             episode_id=episode_id,
             block_rows=block_rows,
             sentence_units=sentence_units,
@@ -378,6 +406,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             apple_timeline=apple_timeline,
             alignments=alignments,
             block_rows=block_rows,
+            final_blocks=final_blocks,
             final_rows=final_rows,
             review_rows=review_rows,
             llm_stats=llm_stats,
@@ -480,7 +509,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
-    final_rows, review_rows, llm_stats = select_final_candidates(
+    final_blocks, final_rows, review_rows, llm_stats = select_final_candidates(
         episode_id=episode_id,
         block_rows=normalized_rows,
         sentence_units=sentence_units,
@@ -503,6 +532,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         apple_timeline=apple_timeline,
         alignments=alignments,
         block_rows=normalized_rows,
+        final_blocks=final_blocks,
         final_rows=final_rows,
         review_rows=review_rows,
         llm_stats=llm_stats,
