@@ -24,6 +24,7 @@ if __package__ is None or __package__ == "":
         _build_char_timeline_from_runs,
         split_text_by_punctuation,
     )
+    from tools.asr_alignment.conversation_boundary_hint_builder import build_conversation_boundary_hints  # type: ignore
 else:
     from ._core import (
         AppleSentenceUnit,
@@ -40,6 +41,7 @@ else:
         _build_char_timeline_from_runs,
         split_text_by_punctuation,
     )
+    from .conversation_boundary_hint_builder import build_conversation_boundary_hints
 
 
 def _find_path(files: dict[str, Path], suffix: str) -> Path | None:
@@ -186,6 +188,7 @@ def build_apple_timeline(input_dir: Path, *, episode_prefix: str | None = None, 
         merged.append(unit)
     # Ensure block_id will be set later by block grouping.
     sentence_units = merged
+    sentence_units = build_conversation_boundary_hints(sentence_units)
     blocks = []
     if sentence_units:
         from ._core import merge_sentence_units_into_blocks  # local import for standalone fallback

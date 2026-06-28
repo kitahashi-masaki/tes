@@ -106,6 +106,7 @@ def _cleanup_boundary_fragments(
     final_text: str,
     apple_text: str,
     selected_source: str,
+    boundary_hints: list[dict[str, Any]] | None = None,
     previous_final_text: str = "",
     previous_selected_text: str = "",
     next_final_text: str = "",
@@ -118,6 +119,7 @@ def _cleanup_boundary_fragments(
     previous_selected_text = str(previous_selected_text or "")
     next_final_text = str(next_final_text or "")
     next_selected_text = str(next_selected_text or "")
+    boundary_hints = list(boundary_hints or [])
     result_text = original_text
     reasons: list[str] = []
     applied = False
@@ -157,9 +159,10 @@ def _cleanup_boundary_fragments(
                 protected_prefix_prevented = True
                 continue
             overlap_ok = False
+            hint_ok = any(hint.get("type") == "short_response_period" for hint in boundary_hints)
             if previous_final_text.endswith(fragment) or previous_selected_text.endswith(fragment):
                 overlap_ok = True
-            elif _LEADING_FRAGMENT_RE.match(fragment) and len(fragment) <= 3:
+            elif hint_ok and _LEADING_FRAGMENT_RE.match(fragment) and len(fragment) <= 3:
                 overlap_ok = True
             if overlap_ok:
                 attempted = True
@@ -177,9 +180,10 @@ def _cleanup_boundary_fragments(
             if len(trimmed) < 3:
                 continue
             overlap_ok = False
+            hint_ok = any(hint.get("type") == "short_response_period" for hint in boundary_hints)
             if next_final_text.startswith(fragment) or next_selected_text.startswith(fragment):
                 overlap_ok = True
-            elif _TRAILING_FRAGMENT_RE.search(fragment) and len(fragment) <= 3:
+            elif hint_ok and _TRAILING_FRAGMENT_RE.search(fragment) and len(fragment) <= 3:
                 overlap_ok = True
             if overlap_ok:
                 attempted = True
@@ -346,6 +350,10 @@ def select_final_candidates(
                 review_reason = merge_review_reasons(review_reason, [failure_reason])
 
         candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
+        segment_units = [unit_map[sid] for sid in segment["sentence_ids"] if sid in unit_map]
+        segment_boundary_hints: list[dict[str, Any]] = []
+        for unit in segment_units:
+            segment_boundary_hints.extend(list(getattr(unit, "boundary_hints", []) or []))
         previous_final_text = final_blocks[-1]["final_text_after_cleanup"] if final_blocks else ""
         previous_selected_text = final_blocks[-1]["candidate_summary"].get(final_blocks[-1]["selected_source"], "") if final_blocks else ""
         next_segment = block_rows[idx + 1] if idx + 1 < len(block_rows) else None
@@ -360,6 +368,7 @@ def select_final_candidates(
             final_text,
             candidate_summary.get("apple", ""),
             selected_source,
+            boundary_hints=segment_boundary_hints,
             previous_final_text=previous_final_text,
             previous_selected_text=previous_selected_text,
             next_final_text=next_final_text,
@@ -416,6 +425,8 @@ def select_final_candidates(
             "needs_review": needs_review,
             "review_reason": review_reason,
             "candidate_summary": candidate_summary,
+            "apple_display_text": candidate_summary.get("apple", ""),
+            "apple_boundary_hints": segment_boundary_hints,
             "punctuation_hint_applied": bool(punctuation["punctuation_hints"]),
             "punctuation_hints": punctuation["punctuation_hints"],
             "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
@@ -457,6 +468,8 @@ def select_final_candidates(
                     "needs_review": needs_review,
                     "review_reason": review_reason,
                     "candidate_summary": candidate_summary,
+                    "apple_display_text": candidate_summary.get("apple", ""),
+                    "apple_boundary_hints": segment_boundary_hints,
                     "punctuation_hint_applied": bool(punctuation["punctuation_hints"]),
                     "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
                     "punctuation_inserted_comma_count": punctuation["punctuation_inserted_comma_count"],
@@ -493,6 +506,8 @@ def select_final_candidates(
                     "selected_source": selected_source,
                     "confidence": float(confidence),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
+                    "apple_display_text": candidate_summary.get("apple", ""),
+                    "apple_boundary_hints": segment_boundary_hints,
                     "final_text_raw": final_text_before_cleanup,
                     "final_text_display": punctuation["display_text"],
                     "punctuation_hints": punctuation["punctuation_hints"],

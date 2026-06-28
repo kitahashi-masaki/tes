@@ -130,6 +130,11 @@ class AppleSentenceUnit:
     source_file: str
     source_index: int
     confidence: float | None = None
+    raw_text: str = ""
+    alignment_text: str = ""
+    boundary_text: str = ""
+    display_text: str = ""
+    boundary_hints: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -703,6 +708,11 @@ def build_sentence_units_from_text(
                 source_file=source_file,
                 source_index=source_index,
                 confidence=None,
+                raw_text=chunk,
+                alignment_text=chunk,
+                boundary_text=chunk,
+                display_text=chunk,
+                boundary_hints=[],
             )
         )
     if units and not units[-1].text.endswith(tuple(SPLIT_PUNCT)):
@@ -742,6 +752,10 @@ def merge_sentence_units_into_blocks(
 
     provisional_blocks: list[AlignmentBlock] = []
     i = 0
+
+    def _has_short_response_hint(unit: AppleSentenceUnit) -> bool:
+        return any(hint.get("type") == "short_response_period" for hint in getattr(unit, "boundary_hints", []) or [])
+
     while i < len(sentence_units):
         start = i
         chosen = [sentence_units[i]]
@@ -750,16 +764,21 @@ def merge_sentence_units_into_blocks(
             candidate = sentence_units[i]
             combined_count = len(chosen) + 1
             combined_duration = candidate.end_sec - chosen[0].start_sec
+            boundary_priority = _has_short_response_hint(chosen[-1]) or _has_short_response_hint(candidate)
+            if boundary_priority and len(chosen) >= min_sentences:
+                break
             if combined_count <= max_sentences and (combined_duration <= max_duration or len(chosen) < min_sentences):
                 chosen.append(candidate)
                 i += 1
                 if len(chosen) >= min_sentences and combined_duration >= min_duration:
+                    if _has_short_response_hint(chosen[-1]) or _has_short_response_hint(chosen[-2] if len(chosen) >= 2 else chosen[-1]):
+                        break
                     break
             else:
                 break
         if len(chosen) == 1 and i < len(sentence_units):
             nxt = sentence_units[i]
-            if (nxt.end_sec - chosen[0].start_sec) <= max_duration:
+            if (nxt.end_sec - chosen[0].start_sec) <= max_duration and not _has_short_response_hint(chosen[-1]):
                 chosen.append(nxt)
                 i += 1
         provisional_blocks.append(_make_block(chosen, source_index=start + 1))

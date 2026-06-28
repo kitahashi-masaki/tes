@@ -24,6 +24,7 @@ if __package__ is None or __package__ == "":
         save_jsonl,
         summarize_quality,
     )
+    from tools.asr_alignment.conversation_boundary_hint_builder import build_conversation_boundary_hints  # type: ignore
 else:
     from ._core import (
         AlignmentBlock,
@@ -39,6 +40,7 @@ else:
         save_jsonl,
         summarize_quality,
     )
+    from .conversation_boundary_hint_builder import build_conversation_boundary_hints
 
 
 def _extract_candidate(
@@ -105,7 +107,13 @@ def _build_block_payload(
     apple_artifact,
     alignments: dict[str, AlignmentResult],
 ) -> tuple[int, dict[str, Any], str]:
-    apple_text = block.text
+    sentence_map = {u.sentence_id: u for u in sentence_units}
+    boundary_hints: list[dict[str, Any]] = []
+    for sid in block.sentence_ids:
+        unit = sentence_map.get(sid)
+        if unit is not None:
+            boundary_hints.extend(list(getattr(unit, "boundary_hints", []) or []))
+    apple_hint_row = build_conversation_boundary_hints([{"text": block.text}], text_attr="text")[0]
     payload: dict[str, Any] = {
         "episode_id": episode_id,
         "block_id": block.block_id,
@@ -116,16 +124,22 @@ def _build_block_payload(
         "is_sub_block": bool(block.is_sub_block),
         "time": {"start_sec": block.start_sec, "end_sec": block.end_sec},
         "apple": {
-            "text": apple_text,
+            "text": block.text,
             "stability_score": block.stability_score,
             "char_start": block.char_start,
             "char_end": block.char_end,
+            "raw_text": apple_hint_row["raw_text"],
+            "alignment_text": apple_hint_row["alignment_text"],
+            "boundary_text": apple_hint_row["boundary_text"],
+            "display_text": apple_hint_row["display_text"],
+            "boundary_hints": apple_hint_row["boundary_hints"],
         },
+        "apple_boundary_hints": boundary_hints,
     }
     candidate_rows: dict[str, dict[str, Any]] = {}
     for engine in ("qwen", "nemotron", "whisper"):
         alignment = alignments[engine]
-        candidate_rows[engine] = _extract_candidate(
+        candidate = _extract_candidate(
             alignment,
             apple_artifact,
             block.char_start,
@@ -133,6 +147,8 @@ def _build_block_payload(
             alignment.asr_artifact,
             source=engine,
         )
+        candidate_rows[engine] = build_conversation_boundary_hints([{"text": candidate["text"]}], text_attr="text")[0]
+        candidate_rows[engine].update(candidate)
     payload.update(candidate_rows)
     usable_asr_candidates = {source: row for source, row in candidate_rows.items() if row.get("usable_for_agreement")}
     candidate_texts = {source: row.get("text", "") for source, row in usable_asr_candidates.items()}
@@ -140,7 +156,8 @@ def _build_block_payload(
     usable_scores = [float(row.get("local_alignment_score", row.get("alignment_score", 0.0))) for row in usable_asr_candidates.values()]
     if not usable_scores:
         usable_scores = [float(row.get("local_alignment_score", row.get("alignment_score", 0.0))) for row in candidate_rows.values()]
-    qwen_diff_type, qwen_similarity, qwen_critical = classify_qwen_apple_difference(apple_text, candidate_rows["qwen"]["text"])
+    qwen_diff_type, qwen_similarity, qwen_critical = classify_qwen_apple_difference(block.text, candidate_rows["qwen"]["text"])
+    apple_layer = apple_hint_row
     alignment_quality = summarize_quality(
         min(usable_scores) if usable_scores else 0.0,
         agreement,
@@ -148,6 +165,11 @@ def _build_block_payload(
         not bool(usable_asr_candidates),
     )
     payload["candidate_agreement_score"] = agreement
+    payload["apple_raw_text"] = block.text
+    payload["apple_alignment_text"] = apple_layer["alignment_text"]
+    payload["apple_boundary_text"] = apple_layer["boundary_text"]
+    payload["apple_display_text"] = apple_layer["display_text"]
+    payload["apple_boundary_hints"] = apple_layer["boundary_hints"]
     payload["qwen_apple_difference_type"] = qwen_diff_type
     payload["qwen_apple_similarity"] = qwen_similarity
     payload["important_term_disagreement"] = qwen_diff_type in {"critical", "semantic"}

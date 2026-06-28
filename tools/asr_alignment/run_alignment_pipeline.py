@@ -195,8 +195,31 @@ def _build_summary(
     post_cleanup_needs_review_count = 0
     llm_called_block_count = 0
     review_reason_char_split_count = 0
+    boundary_hint_used_in_alignment_blocking = False
+    boundary_hint_used_in_candidate_boundary_eval = False
+    boundary_hint_used_in_cleanup = False
+    conversation_boundary_hint_stage = "after_apple_sentence_units_before_alignment_blocks"
+    boundary_hint_applied_sources = set()
+    boundary_hint_applied_count_by_source = Counter()
+    short_response_period_count_by_source = Counter()
+    boundary_text_generated_count_by_source = Counter()
+    display_text_generated_count_by_source = Counter()
     for row in block_rows:
         risk_counts.update(row.get("risk_flags", []))
+        for source in ("apple", "qwen", "nemotron", "whisper"):
+            candidate = row.get(source)
+            if isinstance(candidate, dict):
+                if candidate.get("boundary_hints"):
+                    boundary_hint_applied_sources.add(source)
+                    boundary_hint_applied_count_by_source[source] += len(candidate.get("boundary_hints", []))
+                if candidate.get("short_response_period_count"):
+                    short_response_period_count_by_source[source] += int(candidate.get("short_response_period_count", 0))
+                if candidate.get("boundary_text"):
+                    boundary_text_generated_count_by_source[source] += 1
+                if candidate.get("display_text"):
+                    display_text_generated_count_by_source[source] += 1
+        if row.get("apple_boundary_hints"):
+            boundary_hint_used_in_candidate_boundary_eval = True
         for engine in ("qwen", "apple", "nemotron", "whisper"):
             candidate = row.get(engine)
             if not isinstance(candidate, dict):
@@ -236,6 +259,7 @@ def _build_summary(
             llm_called_block_count += 1
         if block.get("boundary_cleanup_attempted"):
             boundary_cleanup_attempted_count += 1
+            boundary_hint_used_in_cleanup = True
         if block.get("boundary_cleanup_applied"):
             boundary_cleanup_applied_count += 1
         if block.get("boundary_cleanup_reverted"):
@@ -275,6 +299,8 @@ def _build_summary(
             review_reason_char_split_count += 1
     sentence_units = apple_timeline["apple_sentence_units"]
     blocks = apple_timeline["alignment_blocks"]
+    if any(unit.get("boundary_hints") for unit in sentence_units):
+        boundary_hint_used_in_alignment_blocking = True
     avg_sentences_per_block = round(sum(len(b["sentence_ids"]) for b in blocks) / max(len(blocks), 1), 2)
     summary = {
         "episode_id": episode_id,
@@ -300,6 +326,16 @@ def _build_summary(
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),
         "selection_method_counts": dict(selection_method_counts),
+        "conversation_boundary_hint_stage": conversation_boundary_hint_stage,
+        "boundary_hint_applied_sources": sorted(boundary_hint_applied_sources),
+        "boundary_hint_applied_count_by_source": dict(boundary_hint_applied_count_by_source),
+        "short_response_period_count_by_source": dict(short_response_period_count_by_source),
+        "boundary_text_generated_count_by_source": dict(boundary_text_generated_count_by_source),
+        "display_text_generated_count_by_source": dict(display_text_generated_count_by_source),
+        "boundary_hint_generated_before_alignment_blocks": bool(any(unit.get("boundary_hints") for unit in sentence_units)),
+        "boundary_hint_used_in_alignment_blocking": boundary_hint_used_in_alignment_blocking,
+        "boundary_hint_used_in_candidate_boundary_eval": boundary_hint_used_in_candidate_boundary_eval,
+        "boundary_hint_used_in_cleanup": boundary_hint_used_in_cleanup,
         "final_text_raw_equals_display_count": final_text_raw_equals_display_count,
         "final_text_display_changed_count": final_text_display_changed_count,
         "punctuation_normalized_count": punctuation_normalized_count,
@@ -371,6 +407,16 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
+    lines.append(f"- conversation_boundary_hint_stage: {summary['conversation_boundary_hint_stage']}")
+    lines.append(f"- boundary_hint_applied_sources: {summary['boundary_hint_applied_sources']}")
+    lines.append(f"- boundary_hint_applied_count_by_source: {summary['boundary_hint_applied_count_by_source']}")
+    lines.append(f"- short_response_period_count_by_source: {summary['short_response_period_count_by_source']}")
+    lines.append(f"- boundary_text_generated_count_by_source: {summary['boundary_text_generated_count_by_source']}")
+    lines.append(f"- display_text_generated_count_by_source: {summary['display_text_generated_count_by_source']}")
+    lines.append(f"- boundary_hint_generated_before_alignment_blocks: {summary['boundary_hint_generated_before_alignment_blocks']}")
+    lines.append(f"- boundary_hint_used_in_alignment_blocking: {summary['boundary_hint_used_in_alignment_blocking']}")
+    lines.append(f"- boundary_hint_used_in_candidate_boundary_eval: {summary['boundary_hint_used_in_candidate_boundary_eval']}")
+    lines.append(f"- boundary_hint_used_in_cleanup: {summary['boundary_hint_used_in_cleanup']}")
     lines.append(f"- 句点補正件数: {summary['punctuation_normalized_count']}")
     lines.append(f"- 句点挿入数: {summary['punctuation_inserted_period_count']}")
     lines.append(f"- 読点挿入数: {summary['punctuation_inserted_comma_count']}")

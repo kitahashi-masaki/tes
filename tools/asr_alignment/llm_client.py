@@ -93,6 +93,8 @@ class LLMClient:
             f"risk_flags: {segment_payload.get('risk_flags', [])}\n"
             f"alignment_quality: {segment_payload.get('alignment_quality')}\n"
             f"candidate_agreement_score: {segment_payload.get('candidate_agreement_score')}\n"
+            f"apple_display_text: {segment_payload.get('apple_display_text', segment_payload.get('apple', {}).get('text', ''))}\n"
+            f"apple_boundary_hints: {json.dumps(segment_payload.get('apple_boundary_hints', []), ensure_ascii=False)}\n"
             f"candidates: {json.dumps(candidate_summary, ensure_ascii=False)}\n"
         )
         return {
