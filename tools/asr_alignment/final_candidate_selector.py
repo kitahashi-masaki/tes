@@ -20,6 +20,7 @@ if __package__ is None or __package__ == "":
         segment_similarity_score,
         sequence_similarity,
     )
+    from tools.asr_alignment.conversation_punctuation_normalizer import normalize_conversation_punctuation  # type: ignore
 else:
     from ._core import (
         LLMDecision,
@@ -31,6 +32,7 @@ else:
         segment_similarity_score,
         sequence_similarity,
     )
+    from .conversation_punctuation_normalizer import normalize_conversation_punctuation
 
 
 def _combined_score(candidate: dict[str, Any], apple_segment: dict[str, Any], source: str) -> float:
@@ -231,6 +233,19 @@ def _cleanup_boundary_fragments(
     }
 
 
+def _normalize_display_text(text: str, *, short_response_period: bool = True) -> dict[str, Any]:
+    result = normalize_conversation_punctuation(text, short_response_period=short_response_period)
+    return {
+        "display_text": result.display_text,
+        "punctuation_hints": result.punctuation_hints,
+        "punctuation_inserted_period_count": result.inserted_period_count,
+        "punctuation_inserted_comma_count": result.inserted_comma_count,
+        "short_response_period_count": result.short_response_period_count,
+        "possible_speaker_change_period_count": result.possible_speaker_change_period_count,
+        "boundary_hint_used_count": result.boundary_hint_used_count,
+    }
+
+
 def select_final_candidates(
     *,
     episode_id: str,
@@ -241,6 +256,8 @@ def select_final_candidates(
     llm_only_risky: bool = False,
     llm_max_segments: int = 200,
     output_dir: Path | None = None,
+    conversation_punctuation: bool = False,
+    short_response_period: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     final_rows: list[dict[str, Any]] = []
     final_blocks: list[dict[str, Any]] = []
@@ -254,6 +271,13 @@ def select_final_candidates(
         "llm_changed_final_text_count": 0,
         "llm_changed_needs_review_true_count": 0,
         "llm_changed_needs_review_false_count": 0,
+        "punctuation_normalized_count": 0,
+        "punctuation_inserted_period_count": 0,
+        "punctuation_inserted_comma_count": 0,
+        "short_response_period_count": 0,
+        "possible_speaker_change_period_count": 0,
+        "boundary_hint_used_count": 0,
+        "cleanup_reverted_by_punctuation_hint_count": 0,
     }
     previous_end: float | None = None
     risky_calls = 0
@@ -349,6 +373,27 @@ def select_final_candidates(
             needs_review = True
             review_reason = merge_review_reasons(review_reason, ["boundary_cleanup_needed"])
 
+        punctuation = {
+            "display_text": final_text,
+            "punctuation_hints": [],
+            "punctuation_inserted_period_count": 0,
+            "punctuation_inserted_comma_count": 0,
+            "short_response_period_count": 0,
+            "possible_speaker_change_period_count": 0,
+            "boundary_hint_used_count": 0,
+        }
+        if conversation_punctuation:
+            punctuation = _normalize_display_text(final_text, short_response_period=short_response_period)
+            if punctuation["punctuation_hints"]:
+                stats["punctuation_normalized_count"] += 1
+                stats["punctuation_inserted_period_count"] += punctuation["punctuation_inserted_period_count"]
+                stats["punctuation_inserted_comma_count"] += punctuation["punctuation_inserted_comma_count"]
+                stats["short_response_period_count"] += punctuation["short_response_period_count"]
+                stats["possible_speaker_change_period_count"] += punctuation["possible_speaker_change_period_count"]
+                stats["boundary_hint_used_count"] += punctuation["boundary_hint_used_count"]
+                if cleanup["boundary_cleanup_applied"] and punctuation["punctuation_hints"]:
+                    stats["cleanup_reverted_by_punctuation_hint_count"] += 0
+
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
             float(segment_time["start_sec"]),
@@ -362,12 +407,22 @@ def select_final_candidates(
             "sentence_ids": segment["sentence_ids"],
             "time": segment_time,
             "final_text": final_text,
+            "final_text_raw": final_text_before_cleanup,
+            "final_text_after_boundary_cleanup": final_text,
+            "final_text_display": punctuation["display_text"],
             "selected_source": selected_source,
             "selection_method": selection_method,
             "confidence": float(confidence),
             "needs_review": needs_review,
             "review_reason": review_reason,
             "candidate_summary": candidate_summary,
+            "punctuation_hint_applied": bool(punctuation["punctuation_hints"]),
+            "punctuation_hints": punctuation["punctuation_hints"],
+            "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
+            "punctuation_inserted_comma_count": punctuation["punctuation_inserted_comma_count"],
+            "short_response_period_count": punctuation["short_response_period_count"],
+            "possible_speaker_change_period_count": punctuation["possible_speaker_change_period_count"],
+            "boundary_hint_used_count": punctuation["boundary_hint_used_count"],
             "final_text_before_cleanup": final_text_before_cleanup,
             "final_text_after_cleanup": final_text,
             "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
@@ -393,12 +448,21 @@ def select_final_candidates(
                     "time": {"start_sec": unit.start_sec, "end_sec": unit.end_sec},
                     "apple_text": unit.text,
                     "final_text": final_text,
+                    "final_text_raw": final_text_before_cleanup,
+                    "final_text_display": punctuation["display_text"],
+                    "punctuation_hints": punctuation["punctuation_hints"],
                     "selected_source": selected_source,
                     "selection_method": selection_method,
                     "confidence": float(confidence),
                     "needs_review": needs_review,
                     "review_reason": review_reason,
                     "candidate_summary": candidate_summary,
+                    "punctuation_hint_applied": bool(punctuation["punctuation_hints"]),
+                    "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
+                    "punctuation_inserted_comma_count": punctuation["punctuation_inserted_comma_count"],
+                    "short_response_period_count": punctuation["short_response_period_count"],
+                    "possible_speaker_change_period_count": punctuation["possible_speaker_change_period_count"],
+                    "boundary_hint_used_count": punctuation["boundary_hint_used_count"],
                     "final_text_before_cleanup": final_text_before_cleanup,
                     "final_text_after_cleanup": final_text,
                     "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
@@ -429,6 +493,14 @@ def select_final_candidates(
                     "selected_source": selected_source,
                     "confidence": float(confidence),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
+                    "final_text_raw": final_text_before_cleanup,
+                    "final_text_display": punctuation["display_text"],
+                    "punctuation_hints": punctuation["punctuation_hints"],
+                    "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
+                    "punctuation_inserted_comma_count": punctuation["punctuation_inserted_comma_count"],
+                    "short_response_period_count": punctuation["short_response_period_count"],
+                    "possible_speaker_change_period_count": punctuation["possible_speaker_change_period_count"],
+                    "boundary_hint_used_count": punctuation["boundary_hint_used_count"],
                     "final_text_before_cleanup": final_text_before_cleanup,
                     "final_text_after_cleanup": final_text,
                     "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
@@ -449,7 +521,7 @@ def select_final_candidates(
         for row in final_blocks:
             start = row["time"]["start_sec"]
             end = row["time"]["end_sec"]
-            transcript_lines.append(f"- [{start:.2f}-{end:.2f}] {row['final_text']}")
+            transcript_lines.append(f"- [{start:.2f}-{end:.2f}] {row.get('final_text_display', row['final_text'])}")
         (output_dir / "fusion" / f"{episode_id}.final_transcript.md").write_text("\n".join(transcript_lines) + "\n", encoding="utf-8")
         sentence_timeline_lines = []
         for row in final_rows:
@@ -460,7 +532,9 @@ def select_final_candidates(
                         "sentence_id": row["sentence_id"],
                         "block_id": row["block_id"],
                         "time": row["time"],
-                        "apple_text": row["apple_text"],
+                        "raw_text": row["apple_text"],
+                        "display_text": row.get("final_text_display", row["final_text"]),
+                        "punctuation_hints": row.get("punctuation_hints", []),
                     },
                     ensure_ascii=False,
                 )

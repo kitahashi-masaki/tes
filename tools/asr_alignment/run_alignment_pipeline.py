@@ -150,6 +150,8 @@ def _build_summary(
     llm_stats: dict[str, Any],
     validation: dict[str, Any],
     output_dir: Path,
+    conversation_punctuation: bool = False,
+    short_response_period: bool = False,
 ) -> dict[str, Any]:
     quality_counts = Counter(row["alignment_quality"] for row in block_rows)
     risk_counts = Counter()
@@ -173,6 +175,15 @@ def _build_summary(
     selection_method_counts = Counter()
     final_text_equals_apple_text_count = 0
     selected_source_not_apple_final_equals_apple_count = 0
+    final_text_raw_equals_display_count = 0
+    final_text_display_changed_count = 0
+    punctuation_normalized_count = 0
+    punctuation_inserted_period_count = 0
+    punctuation_inserted_comma_count = 0
+    short_response_period_count = 0
+    possible_speaker_change_period_count = 0
+    boundary_hint_used_count = 0
+    cleanup_reverted_by_punctuation_hint_count = 0
     boundary_cleanup_attempted_count = 0
     boundary_cleanup_applied_count = 0
     boundary_cleanup_reverted_count = 0
@@ -241,6 +252,17 @@ def _build_summary(
                 trailing_fragment_removed_count += 1
         if str(block.get("final_text_before_cleanup", block.get("final_text", ""))) != str(block.get("final_text", "")):
             final_text_changed_by_cleanup_count += 1
+        if str(block.get("final_text_raw", block.get("final_text", ""))) == str(block.get("final_text_display", block.get("final_text", ""))):
+            final_text_raw_equals_display_count += 1
+        if str(block.get("final_text_raw", block.get("final_text", ""))) != str(block.get("final_text_display", block.get("final_text", ""))):
+            final_text_display_changed_count += 1
+        if block.get("punctuation_hints"):
+            punctuation_normalized_count += 1
+            punctuation_inserted_period_count += int(block.get("punctuation_inserted_period_count", 0))
+            punctuation_inserted_comma_count += int(block.get("punctuation_inserted_comma_count", 0))
+            short_response_period_count += int(block.get("short_response_period_count", 0))
+            possible_speaker_change_period_count += int(block.get("possible_speaker_change_period_count", 0))
+            boundary_hint_used_count += int(block.get("boundary_hint_used_count", 0))
         if block.get("needs_review") and block.get("boundary_cleanup_applied"):
             post_cleanup_needs_review_count += 1
         if str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
@@ -278,6 +300,15 @@ def _build_summary(
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),
         "selection_method_counts": dict(selection_method_counts),
+        "final_text_raw_equals_display_count": final_text_raw_equals_display_count,
+        "final_text_display_changed_count": final_text_display_changed_count,
+        "punctuation_normalized_count": punctuation_normalized_count,
+        "punctuation_inserted_period_count": punctuation_inserted_period_count,
+        "punctuation_inserted_comma_count": punctuation_inserted_comma_count,
+        "short_response_period_count": short_response_period_count,
+        "possible_speaker_change_period_count": possible_speaker_change_period_count,
+        "boundary_hint_used_count": boundary_hint_used_count,
+        "cleanup_reverted_by_punctuation_hint_count": cleanup_reverted_by_punctuation_hint_count,
         "boundary_cleanup_attempted_count": boundary_cleanup_attempted_count,
         "boundary_cleanup_applied_count": boundary_cleanup_applied_count,
         "boundary_cleanup_reverted_count": boundary_cleanup_reverted_count,
@@ -340,6 +371,13 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
+    lines.append(f"- 句点補正件数: {summary['punctuation_normalized_count']}")
+    lines.append(f"- 句点挿入数: {summary['punctuation_inserted_period_count']}")
+    lines.append(f"- 読点挿入数: {summary['punctuation_inserted_comma_count']}")
+    lines.append(f"- short response 句点件数: {summary['short_response_period_count']}")
+    lines.append(f"- speaker change 句点件数: {summary['possible_speaker_change_period_count']}")
+    lines.append(f"- boundary hint 使用件数: {summary['boundary_hint_used_count']}")
+    lines.append(f"- cleanup reverted by punctuation hint: {summary['cleanup_reverted_by_punctuation_hint_count']}")
     lines.append(f"- boundary cleanup 試行件数: {summary['boundary_cleanup_attempted_count']}")
     lines.append(f"- boundary cleanup 適用件数: {summary['boundary_cleanup_applied_count']}")
     lines.append(f"- boundary cleanup 巻き戻し件数: {summary['boundary_cleanup_reverted_count']}")
@@ -349,6 +387,8 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- protected prefix による抑止件数: {summary['protected_prefix_prevented_cleanup_count']}")
     lines.append(f"- cleanup 後の要確認件数: {summary['post_cleanup_needs_review_count']}")
     lines.append(f"- cleanup による final_text 変更件数: {summary['final_text_changed_by_cleanup_count']}")
+    lines.append(f"- final_text_raw == display 件数: {summary['final_text_raw_equals_display_count']}")
+    lines.append(f"- final_text_display 変更件数: {summary['final_text_display_changed_count']}")
     lines.append("")
     lines.append("## 品質")
     for quality, count in summary["alignment_quality_counts"].items():
@@ -565,6 +605,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         llm_only_risky=args.llm_only_risky,
         llm_max_segments=args.llm_max_segments,
         output_dir=output_dir,
+        conversation_punctuation=args.conversation_punctuation,
+        short_response_period=args.short_response_period,
     )
     print(
         f"[pipeline] final selection end final_rows={len(final_rows)} review_rows={len(review_rows)} "
@@ -585,6 +627,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         llm_stats=llm_stats,
         validation=validation,
         output_dir=output_dir,
+        conversation_punctuation=args.conversation_punctuation,
+        short_response_period=args.short_response_period,
     )
     summary["block_summary"] = block_summary
     summary["normalized_summary"] = normalized_summary
@@ -611,6 +655,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-prefix", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--use-llm", action="store_true")
+    parser.add_argument("--conversation-punctuation", action="store_true")
+    parser.add_argument("--short-response-period", action="store_true")
     parser.add_argument("--llm-endpoint", default="http://127.0.0.1:8010/v1/chat/completions")
     parser.add_argument("--llm-model", default="assistant")
     parser.add_argument("--llm-api-key", default="local-qwen3-assistant")
