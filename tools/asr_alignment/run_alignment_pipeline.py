@@ -173,6 +173,11 @@ def _build_summary(
     selection_method_counts = Counter()
     final_text_equals_apple_text_count = 0
     selected_source_not_apple_final_equals_apple_count = 0
+    boundary_cleanup_applied_count = 0
+    leading_fragment_removed_count = 0
+    trailing_fragment_removed_count = 0
+    final_text_changed_by_cleanup_count = 0
+    post_cleanup_needs_review_count = 0
     llm_called_block_count = 0
     review_reason_char_split_count = 0
     for row in block_rows:
@@ -214,6 +219,18 @@ def _build_summary(
         selection_method_counts[block.get("selection_method", "unknown")] += 1
         if block.get("llm_used"):
             llm_called_block_count += 1
+        if block.get("boundary_cleanup_applied"):
+            boundary_cleanup_applied_count += 1
+        boundary_reasons = block.get("boundary_cleanup_reason", [])
+        if isinstance(boundary_reasons, list):
+            if "leading_fragment_removed" in boundary_reasons:
+                leading_fragment_removed_count += 1
+            if "trailing_fragment_removed" in boundary_reasons:
+                trailing_fragment_removed_count += 1
+        if str(block.get("final_text_before_cleanup", block.get("final_text", ""))) != str(block.get("final_text", "")):
+            final_text_changed_by_cleanup_count += 1
+        if block.get("needs_review") and block.get("boundary_cleanup_applied"):
+            post_cleanup_needs_review_count += 1
         if str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
             final_text_equals_apple_text_count += 1
         if block.get("selected_source") != "apple" and str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
@@ -249,6 +266,11 @@ def _build_summary(
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),
         "selection_method_counts": dict(selection_method_counts),
+        "boundary_cleanup_applied_count": boundary_cleanup_applied_count,
+        "leading_fragment_removed_count": leading_fragment_removed_count,
+        "trailing_fragment_removed_count": trailing_fragment_removed_count,
+        "post_cleanup_needs_review_count": post_cleanup_needs_review_count,
+        "final_text_changed_by_cleanup_count": final_text_changed_by_cleanup_count,
         "llm_called_block_count": llm_called_block_count,
         "review_reason_char_split_count": review_reason_char_split_count,
         "auto_accepted_count": auto_accepted_count,
@@ -302,6 +324,11 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
+    lines.append(f"- boundary cleanup 適用件数: {summary['boundary_cleanup_applied_count']}")
+    lines.append(f"- leading fragment 削除件数: {summary['leading_fragment_removed_count']}")
+    lines.append(f"- trailing fragment 削除件数: {summary['trailing_fragment_removed_count']}")
+    lines.append(f"- cleanup 後の要確認件数: {summary['post_cleanup_needs_review_count']}")
+    lines.append(f"- cleanup による final_text 変更件数: {summary['final_text_changed_by_cleanup_count']}")
     lines.append("")
     lines.append("## 品質")
     for quality, count in summary["alignment_quality_counts"].items():

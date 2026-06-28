@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -76,6 +77,95 @@ def _normalize_review_reason(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return []
+
+
+_LEADING_FRAGMENT_RE = re.compile(r"^(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[ぁ-ゖァ-ヶ]{1,2}。|[一-龯]{1,2}。|ね。|よ。|うん。|あ。|え。|はい。|そう。|そうす|ですよ。|ですね、)$")
+_TRAILING_FRAGMENT_RE = re.compile(r"(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[ぁ-ゖァ-ヶ]{1,2}。|[一-龯]{1,2}。|建|実|な|ポイ|入れ|そうす)$")
+
+
+def _cleanup_boundary_fragments(final_text: str, apple_text: str, selected_source: str) -> dict[str, Any]:
+    original_text = str(final_text or "")
+    apple_text = str(apple_text or "")
+    selected_source = str(selected_source or "")
+    result_text = original_text
+    reasons: list[str] = []
+    applied = False
+
+    if not result_text or selected_source == "apple":
+        return {
+            "final_text_before_cleanup": original_text,
+            "final_text_after_cleanup": result_text,
+            "boundary_cleanup_applied": False,
+            "boundary_cleanup_reason": [],
+        }
+
+    def _score(text: str) -> float:
+        return sequence_similarity(text, apple_text)
+
+    baseline = _score(result_text)
+
+    def _choose_best_trim(is_leading: bool) -> tuple[str, str] | None:
+        best_text = result_text
+        best_reason = ""
+        best_score = baseline
+        candidates: list[tuple[int, str, str]] = []
+        limit = min(6, len(result_text) - 1)
+        for cut in range(1, limit + 1):
+            trimmed = result_text[cut:] if is_leading else result_text[:-cut]
+            if len(trimmed) < 3:
+                continue
+            fragment = result_text[:cut] if is_leading else result_text[-cut:]
+            if not fragment.strip():
+                continue
+            if not (
+                _LEADING_FRAGMENT_RE.match(fragment) if is_leading else _TRAILING_FRAGMENT_RE.search(fragment)
+            ):
+                continue
+            candidates.append((cut, trimmed, fragment))
+        for cut, trimmed, fragment in candidates:
+            score = _score(trimmed)
+            if score > best_score + 0.005 or (abs(score - best_score) <= 0.005 and len(trimmed) > 0 and len(trimmed) < len(best_text)):
+                best_text = trimmed
+                best_score = score
+                best_reason = "leading_fragment_removed" if is_leading else "trailing_fragment_removed"
+        if best_reason:
+            return best_text, best_reason
+        return None
+
+    leading = _choose_best_trim(True)
+    if leading is not None:
+        result_text, reason = leading
+        reasons.append(reason)
+        applied = True
+    trailing = _choose_best_trim(False)
+    if trailing is not None:
+        result_text, reason = trailing
+        reasons.append(reason)
+        applied = True
+
+    if not result_text:
+        result_text = original_text
+        reasons = []
+        applied = False
+
+    unnatural = False
+    if result_text:
+        if len(result_text) <= 2:
+            unnatural = True
+        if result_text[-1] in {"な", "で", "と", "そ", "よ", "ね"} and len(result_text) <= 10:
+            unnatural = True
+        if _LEADING_FRAGMENT_RE.match(result_text[:4]):
+            unnatural = True
+        if _TRAILING_FRAGMENT_RE.search(result_text[-4:]):
+            unnatural = True
+
+    return {
+        "final_text_before_cleanup": original_text,
+        "final_text_after_cleanup": result_text,
+        "boundary_cleanup_applied": applied,
+        "boundary_cleanup_reason": reasons,
+        "boundary_cleanup_needs_review": unnatural,
+    }
 
 
 def select_final_candidates(
@@ -168,6 +258,16 @@ def select_final_candidates(
                 failure_reason = llm_decision.error or "llm_failed"
                 review_reason = merge_review_reasons(review_reason, [failure_reason])
 
+        candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
+        cleanup = _cleanup_boundary_fragments(final_text, candidate_summary.get("apple", ""), selected_source)
+        final_text_before_cleanup = cleanup["final_text_before_cleanup"]
+        final_text = cleanup["final_text_after_cleanup"]
+        if cleanup["boundary_cleanup_applied"]:
+            review_reason = merge_review_reasons(review_reason, cleanup["boundary_cleanup_reason"])
+        if cleanup.get("boundary_cleanup_needs_review"):
+            needs_review = True
+            review_reason = merge_review_reasons(review_reason, ["boundary_cleanup_needed"])
+
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
             float(segment_time["start_sec"]),
@@ -175,7 +275,6 @@ def select_final_candidates(
             previous_end,
         )
         previous_end = segment_time["end_sec"]
-        candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
         block_final = {
             "episode_id": episode_id,
             "block_id": segment["block_id"],
@@ -188,6 +287,10 @@ def select_final_candidates(
             "needs_review": needs_review,
             "review_reason": review_reason,
             "candidate_summary": candidate_summary,
+            "final_text_before_cleanup": final_text_before_cleanup,
+            "final_text_after_cleanup": final_text,
+            "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
+            "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
             "llm_used": bool(should_call),
             "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
             "selection_notes": llm_decision.notes if llm_decision is not None else "",
@@ -211,6 +314,10 @@ def select_final_candidates(
                     "needs_review": needs_review,
                     "review_reason": review_reason,
                     "candidate_summary": candidate_summary,
+                    "final_text_before_cleanup": final_text_before_cleanup,
+                    "final_text_after_cleanup": final_text,
+                    "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
+                    "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
                     "llm_used": bool(should_call),
                     "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
                     "selection_notes": llm_decision.notes if llm_decision is not None else "",
@@ -233,6 +340,10 @@ def select_final_candidates(
                     "selected_source": selected_source,
                     "confidence": float(confidence),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
+                    "final_text_before_cleanup": final_text_before_cleanup,
+                    "final_text_after_cleanup": final_text,
+                    "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
+                    "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
                 }
             )
 
