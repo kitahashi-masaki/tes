@@ -156,22 +156,24 @@ def build_block_candidates(
         payload["risk_flags"] = compute_risk_flags(payload)
         large_span_drift = any(is_large_span_drift(row) for row in candidate_rows.values())
         payload["large_span_drift"] = large_span_drift
+        qwen_local_alignment = float(candidate_rows["qwen"].get("local_alignment_score", 0.0))
         auto_accept = (
             alignment_quality in {"A", "B"}
-            and float(candidate_rows["qwen"].get("local_alignment_score", 0.0)) >= 0.90
+            and qwen_local_alignment >= 0.82
             and agreement >= 0.70
             and "numeric_disagreement" not in payload["risk_flags"]
             and not qwen_critical
             and qwen_diff_type in {"none", "surface", "soft_domain"}
+            and (qwen_diff_type != "soft_domain" or qwen_similarity >= 0.88)
             and "span_too_long" not in payload["risk_flags"]
             and "all_models_disagree" not in payload["risk_flags"]
-            and (not large_span_drift or float(candidate_rows["qwen"].get("local_alignment_score", 0.0)) >= 0.90)
+            and (not large_span_drift or qwen_local_alignment >= 0.90)
         )
         severe_flags = {"all_models_disagree", "numeric_disagreement", "span_too_short", "span_too_long", "qwen_alignment_low", "apple_unstable", "critical_term_disagreement"}
         payload["needs_review"] = not auto_accept and (
             alignment_quality == "E" or (
                 alignment_quality in {"C", "D"} and any(flag in severe_flags for flag in payload["risk_flags"])
-            ) or qwen_diff_type in {"critical", "semantic"} or qwen_critical or (large_span_drift and float(candidate_rows["qwen"].get("local_alignment_score", 0.0)) < 0.90)
+            ) or qwen_diff_type in {"critical", "semantic"} or qwen_critical or (large_span_drift and qwen_local_alignment < 0.90)
         )
         payload["auto_accepted"] = not payload["needs_review"]
         rows.append(payload)
