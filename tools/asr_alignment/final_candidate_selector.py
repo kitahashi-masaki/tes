@@ -106,11 +106,63 @@ _TRAILING_FRAGMENT_RE = re.compile(r"(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[�
 _LEAN_VALIDATION_PREFIXES = ("、", "。", "に対して", "を言うと", "の陣", "ほど。", "とです", "うのも", "は家")
 _LEAN_VALIDATION_SUFFIXES = ("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")
 _BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES = ("ね。", "うことです", "のだから")
+_DOMAIN_ERROR_PHRASES = ("排水の陣", "各家族", "社会行動", "整形立てて")
 
 
 def _has_boundary_contamination_suspect(text: str) -> bool:
     stripped = str(text or "").strip()
     return any(stripped.startswith(prefix) for prefix in _BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES)
+
+
+def _contains_domain_error(text: str) -> bool:
+    return any(phrase in str(text or "") for phrase in _DOMAIN_ERROR_PHRASES)
+
+
+def _without_leading_fragment_suggestion(text: str, apple_text: str) -> tuple[str, list[str]]:
+    original = str(text or "")
+    apple_text = str(apple_text or "")
+    for prefix in ("ね。", "よ。", "よ、"):
+        if original.startswith(prefix) and not apple_text.startswith(prefix):
+            candidate = original[len(prefix):].lstrip()
+            if len(candidate) >= 3 and not any(candidate.startswith(bad) for bad in _LEAN_VALIDATION_PREFIXES):
+                return candidate, ["leading_boundary_fragment_suggested"]
+    return original, []
+
+
+def _domain_preferred_source(
+    candidate_rows: dict[str, dict[str, Any]],
+    selected_source: str,
+    selected_text: str,
+) -> tuple[str, str, list[str]]:
+    if not _contains_domain_error(selected_text):
+        return selected_source, selected_text, []
+    selected_len = max(len(selected_text), 1)
+    scored: list[tuple[float, str, str]] = []
+    for source in ("qwen", "nemotron", "apple", "whisper"):
+        row = candidate_rows.get(source, {})
+        candidate_text = str(row.get("text", "") if isinstance(row, dict) else "")
+        if not candidate_text or _contains_domain_error(candidate_text):
+            continue
+        length_ratio = len(candidate_text) / selected_len
+        if not 0.65 <= length_ratio <= 1.45:
+            continue
+        similarity = segment_similarity_score(selected_text, candidate_text)
+        local_score = float(row.get("local_alignment_score", row.get("alignment_score", 0.0)) or 0.0) if isinstance(row, dict) else 0.0
+        if similarity >= 0.78 and local_score >= 0.70:
+            scored.append((0.75 * similarity + 0.25 * local_score, source, candidate_text))
+    if not scored:
+        return selected_source, selected_text, []
+    scored.sort(reverse=True)
+    _, source, text = scored[0]
+    return source, text, ["domain_error_avoided_by_candidate_switch"]
+
+
+def _classify_large_span_drift(risk_flags: list[str], qwen_alignment: float) -> list[str]:
+    if "large_span_drift" not in risk_flags:
+        return risk_flags
+    if qwen_alignment < 0.90 or "span_too_long" in risk_flags:
+        return risk_flags
+    return ["large_span_drift_warning" if flag == "large_span_drift" else flag for flag in risk_flags]
 
 
 def _deterministic_needs_review(segment: dict[str, Any], risk_flags: list[str], *, cleanup_needs_review: bool) -> bool:
@@ -149,7 +201,7 @@ def _deterministic_needs_review(segment: dict[str, Any], risk_flags: list[str], 
 
 
 def _review_reasons_for_flags(risk_flags: list[str]) -> list[str]:
-    ignored_when_auto_safe = {"surface_difference", "boundary_cleanup_needed"}
+    ignored_when_auto_safe = {"surface_difference", "boundary_cleanup_needed", "large_span_drift_warning"}
     return [flag for flag in risk_flags if flag not in ignored_when_auto_safe]
 
 
@@ -345,6 +397,10 @@ def select_final_candidates(
         "possible_speaker_change_period_count": 0,
         "boundary_hint_used_count": 0,
         "cleanup_reverted_by_punctuation_hint_count": 0,
+        "domain_candidate_switch_count": 0,
+        "suggested_final_text_count": 0,
+        "boundary_suggestion_count": 0,
+        "large_span_drift_warning_count": 0,
     }
     previous_end: float | None = None
     risky_calls = 0
@@ -416,6 +472,16 @@ def select_final_candidates(
                 review_reason = merge_review_reasons(review_reason, [failure_reason])
 
         candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
+        preferred_source, preferred_text, preferred_reasons = _domain_preferred_source(candidate_rows, selected_source, final_text)
+        domain_candidate_switched = False
+        if preferred_source != selected_source:
+            selected_source = preferred_source
+            final_text_raw = preferred_text
+            final_text = preferred_text
+            selection_method = "deterministic_domain_error_avoidance"
+            review_reason = merge_review_reasons(review_reason, preferred_reasons)
+            domain_candidate_switched = True
+            stats["domain_candidate_switch_count"] += 1
         segment_units = [unit_map[sid] for sid in segment["sentence_ids"] if sid in unit_map]
         segment_boundary_hints: list[dict[str, Any]] = []
         for unit in segment_units:
@@ -469,6 +535,11 @@ def select_final_candidates(
                     stats["cleanup_reverted_by_punctuation_hint_count"] += 0
 
         final_risk_flags = list(segment.get("risk_flags", []) or [])
+        qwen_for_review = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+        qwen_alignment_for_review = float(qwen_for_review.get("local_alignment_score", qwen_for_review.get("alignment_score", 0.0)) or 0.0)
+        final_risk_flags = _classify_large_span_drift(final_risk_flags, qwen_alignment_for_review)
+        if "large_span_drift_warning" in final_risk_flags:
+            stats["large_span_drift_warning_count"] += 1
         if _has_boundary_contamination_suspect(final_text) or _has_boundary_contamination_suspect(punctuation["display_text"]):
             needs_review = True
             review_reason = merge_review_reasons(review_reason, ["boundary_contamination_suspected"])
@@ -480,6 +551,14 @@ def select_final_candidates(
         if not llm_explicit_review:
             needs_review = _deterministic_needs_review(segment, final_risk_flags, cleanup_needs_review=cleanup_needs_review)
             review_reason = _review_reasons_for_flags(final_risk_flags) if needs_review else []
+        suggested_final_text, suggestion_reasons = _without_leading_fragment_suggestion(final_text, candidate_summary.get("apple", ""))
+        if suggested_final_text != final_text:
+            stats["suggested_final_text_count"] += 1
+            stats["boundary_suggestion_count"] += 1
+        elif domain_candidate_switched:
+            suggested_final_text = final_text
+            suggestion_reasons = preferred_reasons
+            stats["suggested_final_text_count"] += 1
 
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
@@ -503,6 +582,9 @@ def select_final_candidates(
             "needs_review": needs_review,
             "review_reason": review_reason,
             "risk_flags": final_risk_flags,
+            "suggested_final_text": suggested_final_text,
+            "suggested_final_text_reason": suggestion_reasons,
+            "domain_candidate_switched": domain_candidate_switched,
             "candidate_summary": candidate_summary,
             "apple_display_text": candidate_summary.get("apple", ""),
             "apple_boundary_hints": segment_boundary_hints,
@@ -549,6 +631,9 @@ def select_final_candidates(
                     "needs_review": needs_review,
                     "review_reason": review_reason,
                     "risk_flags": final_risk_flags,
+                    "suggested_final_text": suggested_final_text,
+                    "suggested_final_text_reason": suggestion_reasons,
+                    "domain_candidate_switched": domain_candidate_switched,
                     "candidate_summary": candidate_summary,
                     "apple_display_text": candidate_summary.get("apple", ""),
                     "apple_boundary_hints": segment_boundary_hints,
@@ -585,6 +670,9 @@ def select_final_candidates(
                     "risk_flags": final_risk_flags,
                     "candidate_summary": candidate_summary,
                     "final_text": final_text,
+                    "suggested_final_text": suggested_final_text,
+                    "suggested_final_text_reason": suggestion_reasons,
+                    "domain_candidate_switched": domain_candidate_switched,
                     "selected_source": selected_source,
                     "confidence": float(confidence),
                     "llm_error": llm_decision.error if llm_decision is not None else "",

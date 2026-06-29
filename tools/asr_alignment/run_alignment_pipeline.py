@@ -233,6 +233,10 @@ def _build_summary(
     post_cleanup_needs_review_count = 0
     llm_called_block_count = 0
     review_reason_char_split_count = 0
+    suggested_final_text_count = 0
+    boundary_suggestion_count = 0
+    domain_candidate_switch_count = 0
+    large_span_drift_warning_count = 0
     boundary_hint_used_in_alignment_blocking = False
     boundary_hint_used_in_candidate_boundary_eval = False
     boundary_hint_used_in_cleanup = False
@@ -338,10 +342,24 @@ def _build_summary(
             final_text_equals_apple_text_count += 1
         if block.get("selected_source") != "apple" and str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
             selected_source_not_apple_final_equals_apple_count += 1
+        if block.get("suggested_final_text") and str(block.get("suggested_final_text")) != str(block.get("final_text", "")):
+            suggested_final_text_count += 1
+        if "leading_boundary_fragment_suggested" in (block.get("suggested_final_text_reason") or []):
+            boundary_suggestion_count += 1
+        if block.get("domain_candidate_switched"):
+            domain_candidate_switch_count += 1
+        if "large_span_drift_warning" in (block.get("risk_flags") or []):
+            large_span_drift_warning_count += 1
     for row in review_rows:
         reasons = row.get("review_reason", [])
         if isinstance(reasons, list) and reasons and all(len(str(reason)) == 1 for reason in reasons):
             review_reason_char_split_count += 1
+    final_risk_flag_counts = Counter()
+    final_needs_review_reason_counts = Counter()
+    for block in final_blocks:
+        final_risk_flag_counts.update(block.get("risk_flags", []) or [])
+        if block.get("needs_review"):
+            final_needs_review_reason_counts.update(block.get("review_reason", []) or [])
     sentence_units = apple_timeline["apple_sentence_units"]
     blocks = apple_timeline["alignment_blocks"]
     if any(unit.get("boundary_hints") for unit in sentence_units):
@@ -411,10 +429,16 @@ def _build_summary(
         "final_text_changed_by_cleanup_count": final_text_changed_by_cleanup_count,
         "llm_called_block_count": llm_called_block_count,
         "review_reason_char_split_count": review_reason_char_split_count,
+        "suggested_final_text_count": suggested_final_text_count,
+        "boundary_suggestion_count": boundary_suggestion_count,
+        "domain_candidate_switch_count": domain_candidate_switch_count,
+        "large_span_drift_warning_count": large_span_drift_warning_count,
         "auto_accepted_count": auto_accepted_count,
         "auto_accepted_ratio": round(auto_accepted_count / max(len(block_rows), 1), 3),
         "risk_flag_counts": dict(risk_counts.most_common()),
         "needs_review_reason_counts": dict(review_reason_counts.most_common()),
+        "final_risk_flag_counts": dict(final_risk_flag_counts.most_common()),
+        "final_needs_review_reason_counts": dict(final_needs_review_reason_counts.most_common()),
         "qwen_apple_difference_type_counts": dict(qwen_diff_counts),
         "usable_agreement_candidate_count_distribution": dict(usable_distribution),
         "critical_term_disagreement_count": critical_term_disagreement_count,
@@ -498,6 +522,10 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- cleanup による final_text 変更件数: {summary['final_text_changed_by_cleanup_count']}")
     lines.append(f"- final_text_raw == display 件数: {summary['final_text_raw_equals_display_count']}")
     lines.append(f"- final_text_display 変更件数: {summary['final_text_display_changed_count']}")
+    lines.append(f"- suggested_final_text 件数: {summary.get('suggested_final_text_count', 0)}")
+    lines.append(f"- boundary suggestion 件数: {summary.get('boundary_suggestion_count', 0)}")
+    lines.append(f"- domain candidate switch 件数: {summary.get('domain_candidate_switch_count', 0)}")
+    lines.append(f"- large span drift warning 件数: {summary.get('large_span_drift_warning_count', 0)}")
     lines.append(f"- regression_phrase_counts: {summary.get('regression_phrase_counts', {})}")
     lines.append(f"- domain_error_phrase_counts: {summary.get('domain_error_phrase_counts', {})}")
     lines.append(f"- 出力検証: {summary.get('output_validation', {})}")
