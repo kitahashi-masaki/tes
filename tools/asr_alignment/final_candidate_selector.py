@@ -113,6 +113,46 @@ def _has_boundary_contamination_suspect(text: str) -> bool:
     return any(stripped.startswith(prefix) for prefix in _BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES)
 
 
+def _deterministic_needs_review(segment: dict[str, Any], risk_flags: list[str], *, cleanup_needs_review: bool) -> bool:
+    diff_type = str(segment.get("qwen_apple_difference_type") or "semantic")
+    qwen = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+    qwen_alignment = float(qwen.get("local_alignment_score", qwen.get("alignment_score", 0.0)) or 0.0)
+    qwen_similarity = float(segment.get("qwen_apple_similarity", 0.0) or 0.0)
+    quality = str(segment.get("alignment_quality") or "E")
+    severe_flags = {
+        "critical_term_disagreement",
+        "numeric_disagreement",
+        "boundary_contamination_suspected",
+        "domain_error_phrase",
+        "span_too_long",
+    }
+    if diff_type in {"critical", "semantic"}:
+        return True
+    if quality == "E":
+        return True
+    if qwen_alignment < 0.82:
+        return True
+    if any(flag in risk_flags for flag in severe_flags):
+        return True
+    if "large_span_drift" in risk_flags and qwen_alignment < 0.90:
+        return True
+    if cleanup_needs_review and any(flag in risk_flags for flag in {"boundary_contamination_suspected", "span_too_long"}):
+        return True
+    if (
+        quality in {"A", "B"}
+        and qwen_alignment >= 0.82
+        and qwen_similarity >= 0.88
+        and diff_type in {"none", "surface", "soft_domain"}
+    ):
+        return False
+    return bool(segment.get("needs_review"))
+
+
+def _review_reasons_for_flags(risk_flags: list[str]) -> list[str]:
+    ignored_when_auto_safe = {"surface_difference", "boundary_cleanup_needed"}
+    return [flag for flag in risk_flags if flag not in ignored_when_auto_safe]
+
+
 def _cleanup_boundary_fragments(
     final_text: str,
     apple_text: str,
@@ -404,9 +444,7 @@ def select_final_candidates(
         final_text = cleanup["final_text_after_cleanup"]
         if cleanup["boundary_cleanup_applied"]:
             review_reason = merge_review_reasons(review_reason, cleanup["boundary_cleanup_reason"])
-        if cleanup.get("boundary_cleanup_needs_review"):
-            needs_review = True
-            review_reason = merge_review_reasons(review_reason, ["boundary_cleanup_needed"])
+        cleanup_needs_review = bool(cleanup.get("boundary_cleanup_needs_review"))
 
         display_source_text = _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
         punctuation = {
@@ -436,6 +474,12 @@ def select_final_candidates(
             review_reason = merge_review_reasons(review_reason, ["boundary_contamination_suspected"])
             if "boundary_contamination_suspected" not in final_risk_flags:
                 final_risk_flags.append("boundary_contamination_suspected")
+        if cleanup_needs_review and "boundary_cleanup_needed" not in final_risk_flags:
+            final_risk_flags.append("boundary_cleanup_needed")
+        llm_explicit_review = llm_decision is not None and llm_decision.needs_review is not None
+        if not llm_explicit_review:
+            needs_review = _deterministic_needs_review(segment, final_risk_flags, cleanup_needs_review=cleanup_needs_review)
+            review_reason = _review_reasons_for_flags(final_risk_flags) if needs_review else []
 
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
