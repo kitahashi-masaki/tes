@@ -395,6 +395,8 @@ def build_block_candidates(
     engine_skip = Counter()
     engine_cache_hit = Counter()
     engine_early_exit = Counter()
+    engine_cheap_accept = Counter()
+    engine_heavy_skipped = Counter()
     fallback_expanded = Counter()
     search_radius_sum = Counter()
     search_radius_max = Counter()
@@ -440,6 +442,10 @@ def build_block_candidates(
                     search_radius_max[engine] = max(search_radius_max[engine], sr)
                     if cand.get("early_exit"):
                         engine_early_exit[engine] += 1
+                    if cand.get("cheap_span_accept"):
+                        engine_cheap_accept[engine] += 1
+                    if cand.get("heavy_refinement_skipped"):
+                        engine_heavy_skipped[engine] += 1
                     if cand.get("fallback_expanded"):
                         fallback_expanded[engine] += 1
             completed += 1
@@ -456,6 +462,8 @@ def build_block_candidates(
         "quality_counts": quality_counts,
         "needs_review_count": sum(1 for row in rows if row["needs_review"]),
         "candidate_build_total_sec": total_sec,
+        "candidate_build_wall_sec": total_sec,
+        "candidate_build_cumulative_stage_sec": round(sum(stage_secs.values()), 4),
         "candidate_build_sec_by_stage": {
             "sentence_map_and_hints": round(stage_secs["sentence_map_and_hints"], 4),
             "apple_boundary_layer": round(stage_secs["apple_boundary_layer"], 4),
@@ -479,6 +487,8 @@ def build_block_candidates(
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
         "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
+        "cheap_span_accept_count_by_engine": dict(engine_cheap_accept),
+        "heavy_refinement_skipped_count_by_engine": dict(engine_heavy_skipped),
         "fallback_expanded_count_by_engine": dict(fallback_expanded),
         "average_search_radius_by_engine": {
             engine: round(search_radius_sum[engine] / max(engine_exec[engine], 1), 2) for engine in ("qwen", "nemotron", "whisper")

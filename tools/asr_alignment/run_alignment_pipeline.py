@@ -226,11 +226,14 @@ def _build_summary(
         for source in ("apple", "qwen", "nemotron", "whisper"):
             candidate = row.get(source)
             if isinstance(candidate, dict):
-                if candidate.get("boundary_hints"):
+                hints = list(candidate.get("boundary_hints", []) or [])
+                if hints:
                     boundary_hint_applied_sources.add(source)
-                    boundary_hint_applied_count_by_source[source] += len(candidate.get("boundary_hints", []))
-                if candidate.get("short_response_period_count"):
-                    short_response_period_count_by_source[source] += int(candidate.get("short_response_period_count", 0))
+                    boundary_hint_applied_count_by_source[source] += len(hints)
+                    for hint in hints:
+                        if hint.get("type") == "short_response_period":
+                            short_response_period_count_by_source[source] += 1
+                            short_response_period_count += 1
                 if candidate.get("boundary_text"):
                     boundary_text_generated_count_by_source[source] += 1
                 if candidate.get("display_text"):
@@ -304,9 +307,10 @@ def _build_summary(
             punctuation_normalized_count += 1
             punctuation_inserted_period_count += int(block.get("punctuation_inserted_period_count", 0))
             punctuation_inserted_comma_count += int(block.get("punctuation_inserted_comma_count", 0))
-            short_response_period_count += int(block.get("short_response_period_count", 0))
             possible_speaker_change_period_count += int(block.get("possible_speaker_change_period_count", 0))
             boundary_hint_used_count += int(block.get("boundary_hint_used_count", 0))
+        if block.get("apple_boundary_hints"):
+            boundary_hint_used_count += len(block.get("apple_boundary_hints", []))
         if block.get("needs_review") and block.get("boundary_cleanup_applied"):
             post_cleanup_needs_review_count += 1
         if str(block.get("final_text", "")) == str(block.get("candidate_summary", {}).get("apple", "")):
@@ -342,6 +346,10 @@ def _build_summary(
         "needs_review_count": sum(1 for row in block_rows if row["needs_review"]),
         "final_block_count": len(final_blocks),
         "final_sentence_timeline_count": len(final_rows),
+        "candidate_build_wall_sec": block_summary.get("candidate_build_wall_sec", block_summary.get("candidate_build_total_sec")),
+        "candidate_build_cumulative_stage_sec": block_summary.get("candidate_build_cumulative_stage_sec"),
+        "candidate_build_sec_by_stage": block_summary.get("candidate_build_sec_by_stage", {}),
+        "candidate_build_sec_by_stage_mean": block_summary.get("candidate_build_sec_by_stage_mean", {}),
         "final_text_equals_apple_text_count": final_text_equals_apple_text_count,
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),

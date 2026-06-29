@@ -535,6 +535,45 @@ def refine_local_asr_span(
             len(asr_artifact.raw_text),
             max(initial_char_start + max(len(apple_artifact.raw_text[apple_raw_start:apple_raw_end]), 1), initial_char_start + 1),
         )
+    initial_text = asr_artifact.raw_text[initial_char_start:initial_char_end]
+    initial_local_alignment_score = max(0.0, min(1.0, _span_similarity(apple_target, initial_text)))
+    initial_norm_len = len(_normalize_span_text(initial_text))
+    apple_norm_len = max(len(_normalize_span_text(apple_target)), 1)
+    span_length_ratio = initial_norm_len / apple_norm_len
+    initial_boundary_contamination = (
+        not initial_text.strip()
+        or initial_text[:1].isspace()
+        or initial_text[-1:].isspace()
+    )
+    if (
+        initial_local_alignment_score >= 0.96
+        and 0.75 <= span_length_ratio <= 1.35
+        and not initial_boundary_contamination
+    ):
+        return {
+            "initial_char_start": initial_char_start,
+            "initial_char_end": initial_char_end,
+            "refined_char_start": initial_char_start,
+            "refined_char_end": initial_char_end,
+            "local_alignment_score": initial_local_alignment_score,
+            "span_refined": False,
+            "span_drift_start": 0,
+            "span_drift_end": 0,
+            "boundary_contamination": False,
+            "span_too_short": False,
+            "span_too_long": False,
+            "span_boundary_adjusted": False,
+            "span_boundary_adjust_reason": [],
+            "usable_for_agreement": len(_normalize_span_text(initial_text)) > 2,
+            "unusable_reason": "" if len(_normalize_span_text(initial_text)) > 2 else "too_short",
+            "initial_text": initial_text,
+            "refined_text": initial_text,
+            "early_exit": True,
+            "early_exit_reason": "high_local_alignment",
+            "cheap_span_accept": True,
+            "cheap_span_accept_reason": "high_initial_alignment",
+            "heavy_refinement_skipped": True,
+        }
 
     target_len = max(apple_norm_end - apple_norm_start, 1)
     window_left = max(0, projected_norm_start - search_radius)
@@ -636,6 +675,11 @@ def refine_local_asr_span(
         "unusable_reason": unusable_reason,
         "initial_text": initial_text,
         "refined_text": refined_text,
+        "early_exit": False,
+        "early_exit_reason": "",
+        "cheap_span_accept": False,
+        "cheap_span_accept_reason": "",
+        "heavy_refinement_skipped": False,
     }
 
 

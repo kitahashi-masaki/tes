@@ -250,6 +250,18 @@ def _normalize_display_text(text: str, *, short_response_period: bool = True) ->
     }
 
 
+def _select_display_source_text(candidate_rows: dict[str, dict[str, Any]], selected_source: str, apple_display_text: str) -> str:
+    row = candidate_rows.get(selected_source, {})
+    if isinstance(row, dict):
+        for key in ("display_text", "boundary_text", "raw_text", "text"):
+            value = row.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    if apple_display_text.strip():
+        return apple_display_text
+    return candidate_rows.get("apple", {}).get("text", "")
+
+
 def select_final_candidates(
     *,
     episode_id: str,
@@ -290,7 +302,8 @@ def select_final_candidates(
         candidate_rows = {source: segment[source] for source in ("qwen", "apple", "nemotron", "whisper")}
         best_source, deterministic = _deterministic_selection(candidate_rows, segment)
         selected_source = deterministic["selected_source"]
-        final_text = deterministic["final_text"]
+        final_text_raw = deterministic["final_text"]
+        final_text = final_text_raw
         confidence = deterministic["confidence"]
         selection_method = deterministic["selection_method"]
         needs_review = bool(segment.get("needs_review"))
@@ -328,7 +341,8 @@ def select_final_candidates(
                 llm_source = normalize_source_choice(llm_decision.selected_source)
                 if llm_source in candidate_rows:
                     selected_source = llm_source
-                    final_text = candidate_rows[llm_source].get("text", final_text)
+                    final_text_raw = candidate_rows[llm_source].get("text", final_text_raw)
+                    final_text = final_text_raw
                     confidence = llm_decision.confidence if llm_decision.confidence is not None else confidence
                     selection_method = "llm_candidate_selection"
                 if llm_decision.final_text:
@@ -336,6 +350,7 @@ def select_final_candidates(
                     if llm_text and segment_similarity_score(llm_text, final_text) < 0.95:
                         stats["llm_changed_final_text_count"] += 1
                     if llm_text:
+                        final_text_raw = llm_text
                         final_text = llm_text
                 if llm_decision.needs_review is not None:
                     if llm_decision.needs_review and not needs_review:
@@ -382,8 +397,9 @@ def select_final_candidates(
             needs_review = True
             review_reason = merge_review_reasons(review_reason, ["boundary_cleanup_needed"])
 
+        display_source_text = _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
         punctuation = {
-            "display_text": final_text,
+            "display_text": display_source_text,
             "punctuation_hints": [],
             "punctuation_inserted_period_count": 0,
             "punctuation_inserted_comma_count": 0,
@@ -392,7 +408,7 @@ def select_final_candidates(
             "boundary_hint_used_count": 0,
         }
         if conversation_punctuation:
-            punctuation = _normalize_display_text(final_text, short_response_period=short_response_period)
+            punctuation = _normalize_display_text(display_source_text, short_response_period=short_response_period)
             if punctuation["punctuation_hints"]:
                 stats["punctuation_normalized_count"] += 1
                 stats["punctuation_inserted_period_count"] += punctuation["punctuation_inserted_period_count"]
