@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
+import urllib.error
+import urllib.request
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,6 +47,9 @@ class LLMClient:
         cache_dir: Path,
         timeout: float = 20.0,
         prompt_version: str = "v1",
+        ready_endpoint: str | None = None,
+        ready_timeout: float = 600.0,
+        ready_poll_interval: float = 5.0,
     ) -> None:
         self.endpoint = endpoint
         self.model = model
@@ -51,7 +57,56 @@ class LLMClient:
         self.cache_dir = cache_dir
         self.timeout = timeout
         self.prompt_version = prompt_version
+        self.ready_endpoint = ready_endpoint or self._derive_models_endpoint(endpoint)
+        self.ready_timeout = ready_timeout
+        self.ready_poll_interval = ready_poll_interval
         safe_mkdir(cache_dir)
+
+    @staticmethod
+    def _derive_models_endpoint(endpoint: str) -> str:
+        if endpoint.endswith("/chat/completions"):
+            return endpoint[: -len("/chat/completions")] + "/models"
+        return endpoint.rstrip("/") + "/models"
+
+    def _models_ready(self) -> bool:
+        req = urllib.request.Request(
+            self.ready_endpoint,
+            method="GET",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=min(self.timeout, 10.0)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        data = payload.get("data") or []
+        model_ids = {str(item.get("id") or "") for item in data if isinstance(item, dict)}
+        if not model_ids:
+            return False
+        if self.model and self.model not in model_ids:
+            return False
+        return True
+
+    def wait_for_ready(self) -> None:
+        deadline = time.monotonic() + self.ready_timeout
+        last_status: str = "unknown"
+        while True:
+            try:
+                if self._models_ready():
+                    print(f"[llm] ready endpoint={self.ready_endpoint} model={self.model}", flush=True)
+                    return
+                last_status = "model_not_listed"
+            except Exception as exc:  # noqa: BLE001
+                last_status = f"{type(exc).__name__}: {exc}"
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"LLM model not ready after {self.ready_timeout:.0f}s: endpoint={self.ready_endpoint} model={self.model} last_status={last_status}"
+                )
+            print(
+                f"[llm] waiting endpoint={self.ready_endpoint} model={self.model} last_status={last_status}",
+                flush=True,
+            )
+            time.sleep(self.ready_poll_interval)
 
     def should_call(self, segment_payload: dict[str, Any], *, only_risky: bool) -> bool:
         if only_risky and not segment_payload.get("needs_review"):

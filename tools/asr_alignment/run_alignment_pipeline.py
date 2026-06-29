@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import shutil
 import sys
@@ -70,6 +71,22 @@ def _discover_episode_prefix(input_dir: Path, episode_prefix: str | None) -> str
 def _force_clean_output(output_dir: Path) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
+
+
+def _install_timed_print() -> None:
+    started_at = time.perf_counter()
+    original_print = builtins.print
+
+    def timed_print(*args: Any, **kwargs: Any) -> None:
+        elapsed = max(0, int(time.perf_counter() - started_at))
+        prefix = f"[{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}]"
+        if args and isinstance(args[0], str):
+            args = (f"{prefix} {args[0]}",) + args[1:]
+        else:
+            args = (prefix, *args)
+        original_print(*args, **kwargs)
+
+    builtins.print = timed_print
 
 
 def _load_alignment_result_from_files(output_dir: Path, episode_id: str, engine: str) -> AlignmentResult:
@@ -519,6 +536,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 api_key=args.llm_api_key,
                 cache_dir=output_dir / "llm_cache",
             )
+            print("[pipeline] llm ready check start", flush=True)
+            llm_client.wait_for_ready()
+            print("[pipeline] llm ready check end", flush=True)
         print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
         final_blocks, final_rows, review_rows, llm_stats = select_final_candidates(
             episode_id=episode_id,
@@ -646,6 +666,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             api_key=args.llm_api_key,
             cache_dir=output_dir / "llm_cache",
         )
+        print("[pipeline] llm ready check start", flush=True)
+        llm_client.wait_for_ready()
+        print("[pipeline] llm ready check end", flush=True)
 
     print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
     final_blocks, final_rows, review_rows, llm_stats = select_final_candidates(
@@ -731,6 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _install_timed_print()
     args = build_parser().parse_args()
     summary = run_pipeline(args)
     print(json.dumps({"episode_id": summary["episode_id"], "output_dir": summary["output_dir"], "apple_sentence_unit_count": summary["apple_sentence_unit_count"], "alignment_block_count": summary["alignment_block_count"], "needs_review_count": summary["needs_review_count"], "llm_used": summary["llm_used"]}, ensure_ascii=False, indent=2))
