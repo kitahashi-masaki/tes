@@ -107,6 +107,7 @@ _LEAN_VALIDATION_PREFIXES = ("、", "。", "に対して", "を言うと", "の�
 _LEAN_VALIDATION_SUFFIXES = ("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")
 _BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES = ("ね。", "うことです", "のだから")
 _DOMAIN_ERROR_PHRASES = ("排水の陣", "各家族", "社会行動", "整形立てて")
+_TRAILING_FRAGMENT_SUFFIXES = ("、よ", "。聞", "、し", "。し", "でそうす", "とこ", "依")
 
 
 def _has_boundary_contamination_suspect(text: str) -> bool:
@@ -121,12 +122,23 @@ def _contains_domain_error(text: str) -> bool:
 def _without_leading_fragment_suggestion(text: str, apple_text: str) -> tuple[str, list[str]]:
     original = str(text or "")
     apple_text = str(apple_text or "")
+    suggested = original
+    reasons: list[str] = []
     for prefix in ("ね。", "よ。", "よ、"):
-        if original.startswith(prefix) and not apple_text.startswith(prefix):
-            candidate = original[len(prefix):].lstrip()
+        if suggested.startswith(prefix) and not apple_text.startswith(prefix):
+            candidate = suggested[len(prefix):].lstrip()
             if len(candidate) >= 3 and not any(candidate.startswith(bad) for bad in _LEAN_VALIDATION_PREFIXES):
-                return candidate, ["leading_boundary_fragment_suggested"]
-    return original, []
+                suggested = candidate
+                reasons.append("leading_boundary_fragment_suggested")
+            break
+    for suffix in _TRAILING_FRAGMENT_SUFFIXES:
+        if suggested.endswith(suffix):
+            candidate = suggested[: -len(suffix)].rstrip()
+            if len(candidate) >= 3 and not candidate.endswith(_LEAN_VALIDATION_SUFFIXES):
+                suggested = candidate
+                reasons.append("trailing_boundary_fragment_suggested")
+            break
+    return suggested, reasons
 
 
 def _domain_preferred_source(
@@ -201,7 +213,7 @@ def _deterministic_needs_review(segment: dict[str, Any], risk_flags: list[str], 
 
 
 def _review_reasons_for_flags(risk_flags: list[str]) -> list[str]:
-    ignored_when_auto_safe = {"surface_difference", "boundary_cleanup_needed", "large_span_drift_warning"}
+    ignored_when_auto_safe = {"surface_difference", "boundary_cleanup_needed", "large_span_drift_warning", "domain_error_avoided"}
     return [flag for flag in risk_flags if flag not in ignored_when_auto_safe]
 
 
@@ -398,8 +410,10 @@ def select_final_candidates(
         "boundary_hint_used_count": 0,
         "cleanup_reverted_by_punctuation_hint_count": 0,
         "domain_candidate_switch_count": 0,
+        "domain_error_avoided_count": 0,
         "suggested_final_text_count": 0,
         "boundary_suggestion_count": 0,
+        "trailing_boundary_suggestion_count": 0,
         "large_span_drift_warning_count": 0,
     }
     previous_end: float | None = None
@@ -538,6 +552,10 @@ def select_final_candidates(
         qwen_for_review = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
         qwen_alignment_for_review = float(qwen_for_review.get("local_alignment_score", qwen_for_review.get("alignment_score", 0.0)) or 0.0)
         final_risk_flags = _classify_large_span_drift(final_risk_flags, qwen_alignment_for_review)
+        if "domain_error_phrase" in final_risk_flags and not _contains_domain_error(final_text) and not _contains_domain_error(punctuation["display_text"]):
+            final_risk_flags = [flag for flag in final_risk_flags if flag != "domain_error_phrase"]
+            final_risk_flags.append("domain_error_avoided")
+            stats["domain_error_avoided_count"] += 1
         if "large_span_drift_warning" in final_risk_flags:
             stats["large_span_drift_warning_count"] += 1
         if _has_boundary_contamination_suspect(final_text) or _has_boundary_contamination_suspect(punctuation["display_text"]):
@@ -554,7 +572,14 @@ def select_final_candidates(
         suggested_final_text, suggestion_reasons = _without_leading_fragment_suggestion(final_text, candidate_summary.get("apple", ""))
         if suggested_final_text != final_text:
             stats["suggested_final_text_count"] += 1
-            stats["boundary_suggestion_count"] += 1
+            if "leading_boundary_fragment_suggested" in suggestion_reasons:
+                stats["boundary_suggestion_count"] += 1
+            if "trailing_boundary_fragment_suggested" in suggestion_reasons:
+                stats["trailing_boundary_suggestion_count"] += 1
+            if "boundary_suggestion_available" not in final_risk_flags:
+                final_risk_flags.append("boundary_suggestion_available")
+            needs_review = True
+            review_reason = merge_review_reasons(review_reason, ["boundary_suggestion_available"])
         elif domain_candidate_switched:
             suggested_final_text = final_text
             suggestion_reasons = preferred_reasons

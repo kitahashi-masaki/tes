@@ -425,6 +425,7 @@ def _build_block_payload(
     t_stage = time.perf_counter()
     qwen_diff_type, qwen_similarity, qwen_critical = classify_qwen_apple_difference(block.text, qwen_layer["text"])
     qwen_numeric_disagreement = _has_numeric_disagreement(block.text, qwen_layer["text"])
+    qwen_domain_error = bool(_domain_error_phrase_counts([qwen_layer.get("text", "")]))
     preliminary_agreement = candidate_agreement_score({"apple": block.text, "qwen": qwen_layer.get("text", "")})
     preliminary_quality = summarize_quality(
         min(float(qwen_layer.get("local_alignment_score", 0.0)), float(block.stability_score)),
@@ -433,11 +434,12 @@ def _build_block_payload(
         False,
     )
     qwen_high_confidence = (
-        qwen_layer.get("local_alignment_score", 0.0) >= 0.92
-        and qwen_similarity >= 0.90
+        qwen_layer.get("local_alignment_score", 0.0) >= 0.90
+        and qwen_similarity >= 0.88
         and qwen_diff_type in {"none", "surface", "soft_domain"}
         and not qwen_numeric_disagreement
         and not qwen_critical
+        and not qwen_domain_error
         and preliminary_quality in {"A", "B"}
         and qwen_layer.get("boundary_contamination") is False
         and qwen_layer.get("usable_for_agreement") is True
@@ -506,6 +508,8 @@ def _build_block_payload(
     payload["apple_boundary_hints"] = apple_layer["boundary_hints"]
     payload["qwen_apple_difference_type"] = qwen_diff_type
     payload["qwen_apple_similarity"] = qwen_similarity
+    payload["qwen_high_confidence"] = qwen_high_confidence
+    payload["qwen_domain_error"] = qwen_domain_error
     payload["important_term_disagreement"] = qwen_diff_type in {"critical", "semantic"}
     payload["critical_term_disagreement"] = qwen_critical
     payload["soft_domain_difference"] = qwen_diff_type == "soft_domain"
