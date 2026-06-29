@@ -195,13 +195,20 @@ def _build_block_payload(
     build_stats_lock: Lock | None = None,
 ) -> tuple[int, dict[str, Any], str]:
     build_stats = build_stats or {}
+    t_block = time.perf_counter()
+    stage_secs = defaultdict(float)
     sentence_map = {u.sentence_id: u for u in sentence_units}
+    t_stage = time.perf_counter()
     boundary_hints: list[dict[str, Any]] = []
     for sid in block.sentence_ids:
         unit = sentence_map.get(sid)
         if unit is not None:
             boundary_hints.extend(list(getattr(unit, "boundary_hints", []) or []))
+    stage_secs["sentence_map_and_hints"] += time.perf_counter() - t_stage
+    t_stage = time.perf_counter()
     apple_hint_row = _build_boundary_layer_cached(source="apple", text=block.text, stats=build_stats, stats_lock=build_stats_lock)
+    stage_secs["apple_boundary_layer"] += time.perf_counter() - t_stage
+    t_stage = time.perf_counter()
     payload: dict[str, Any] = {
         "episode_id": episode_id,
         "block_id": block.block_id,
@@ -235,7 +242,9 @@ def _build_block_payload(
         },
         "apple_boundary_hints": boundary_hints,
     }
+    stage_secs["apple_payload_init"] += time.perf_counter() - t_stage
     candidate_rows: dict[str, dict[str, Any]] = {}
+    t_stage = time.perf_counter()
     qwen_alignment = alignments["qwen"]
     qwen_candidate = _extract_candidate(
         qwen_alignment,
@@ -245,9 +254,12 @@ def _build_block_payload(
         qwen_alignment.asr_artifact,
         source="qwen",
     )
+    stage_secs["qwen_refinement"] += time.perf_counter() - t_stage
+    t_stage = time.perf_counter()
     qwen_layer = _build_boundary_layer_cached(source="qwen", text=qwen_candidate["text"], stats=build_stats, stats_lock=build_stats_lock)
     qwen_layer.update(qwen_candidate)
     candidate_rows["qwen"] = qwen_layer
+    stage_secs["qwen_boundary_layer"] += time.perf_counter() - t_stage
 
     qwen_high_confidence = (
         qwen_layer.get("local_alignment_score", 0.0) >= 0.92
@@ -258,6 +270,7 @@ def _build_block_payload(
     if candidate_build_mode == "qwen-only":
         skip_support = True
 
+    t_stage = time.perf_counter()
     for engine in ("nemotron", "whisper"):
         if skip_support:
             candidate_rows[engine] = _build_placeholder_candidate(
@@ -267,6 +280,7 @@ def _build_block_payload(
             )
             continue
         alignment = alignments[engine]
+        t_engine = time.perf_counter()
         candidate = _extract_candidate(
             alignment,
             apple_artifact,
@@ -275,8 +289,13 @@ def _build_block_payload(
             alignment.asr_artifact,
             source=engine,
         )
+        stage_secs[f"{engine}_refinement"] += time.perf_counter() - t_engine
+        t_engine = time.perf_counter()
         candidate_rows[engine] = _build_boundary_layer_cached(source=engine, text=candidate["text"], stats=build_stats, stats_lock=build_stats_lock)
         candidate_rows[engine].update(candidate)
+        stage_secs[f"{engine}_boundary_layer"] += time.perf_counter() - t_engine
+    stage_secs["support_candidates"] += time.perf_counter() - t_stage
+    t_stage = time.perf_counter()
     payload.update(candidate_rows)
     usable_asr_candidates = {source: row for source, row in candidate_rows.items() if row.get("usable_for_agreement")}
     candidate_texts = {source: row.get("text", "") for source, row in usable_asr_candidates.items()}
@@ -285,6 +304,8 @@ def _build_block_payload(
     if not usable_scores:
         usable_scores = [float(row.get("local_alignment_score", row.get("alignment_score", 0.0))) for row in candidate_rows.values()]
     qwen_diff_type, qwen_similarity, qwen_critical = classify_qwen_apple_difference(block.text, candidate_rows["qwen"]["text"])
+    stage_secs["agreement_and_difference"] += time.perf_counter() - t_stage
+    t_stage = time.perf_counter()
     apple_layer = apple_hint_row
     alignment_quality = summarize_quality(
         min(usable_scores) if usable_scores else 0.0,
@@ -306,6 +327,8 @@ def _build_block_payload(
     payload["usable_asr_candidates"] = usable_asr_candidates
     payload["alignment_quality"] = alignment_quality
     payload["risk_flags"] = compute_risk_flags(payload)
+    stage_secs["risk_flag_classification"] += time.perf_counter() - t_stage
+    t_stage = time.perf_counter()
     large_span_drift = any(is_large_span_drift(row) for row in candidate_rows.values())
     payload["large_span_drift"] = large_span_drift
     qwen_local_alignment = float(candidate_rows["qwen"].get("local_alignment_score", 0.0))
@@ -341,6 +364,9 @@ def _build_block_payload(
     payload["qwen"]["boundary_hint_used_for_boundary_eval"] = bool(boundary_hints)
     payload["qwen"]["boundary_warning"] = False
     payload["qwen"]["boundary_warning_reason"] = []
+    stage_secs["final_payload_finalize"] += time.perf_counter() - t_stage
+    payload["block_build_sec_by_stage"] = dict(stage_secs)
+    payload["block_build_total_sec"] = time.perf_counter() - t_block
     return idx, payload, alignment_quality
 
 
@@ -372,6 +398,7 @@ def build_block_candidates(
     fallback_expanded = Counter()
     search_radius_sum = Counter()
     search_radius_max = Counter()
+    stage_secs = defaultdict(float)
     build_stats = {
         "boundary_hint_build_total_sec": 0.0,
         "boundary_hint_build_count_by_source": Counter(),
@@ -400,6 +427,8 @@ def build_block_candidates(
             idx, payload, alignment_quality = future.result()
             rows[idx - 1] = payload
             quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
+            for stage_name, elapsed in (payload.get("block_build_sec_by_stage") or {}).items():
+                stage_secs[stage_name] += float(elapsed)
             for engine in ("qwen", "nemotron", "whisper"):
                 cand = payload.get(engine, {})
                 if cand.get("skipped"):
@@ -428,15 +457,24 @@ def build_block_candidates(
         "needs_review_count": sum(1 for row in rows if row["needs_review"]),
         "candidate_build_total_sec": total_sec,
         "candidate_build_sec_by_stage": {
-            "prepare_artifacts": 0.0,
-            "qwen_refinement": 0.0,
-            "nemotron_refinement": 0.0,
-            "whisper_refinement": 0.0,
-            "candidate_payload_build": total_sec,
-            "boundary_hint_attach": 0.0,
-            "risk_classification": 0.0,
+            "sentence_map_and_hints": round(stage_secs["sentence_map_and_hints"], 4),
+            "apple_boundary_layer": round(stage_secs["apple_boundary_layer"], 4),
+            "apple_payload_init": round(stage_secs["apple_payload_init"], 4),
+            "qwen_refinement": round(stage_secs["qwen_refinement"], 4),
+            "qwen_boundary_layer": round(stage_secs["qwen_boundary_layer"], 4),
+            "nemotron_refinement": round(stage_secs["nemotron_refinement"], 4),
+            "nemotron_boundary_layer": round(stage_secs["nemotron_boundary_layer"], 4),
+            "whisper_refinement": round(stage_secs["whisper_refinement"], 4),
+            "whisper_boundary_layer": round(stage_secs["whisper_boundary_layer"], 4),
+            "support_candidates": round(stage_secs["support_candidates"], 4),
+            "agreement_and_difference": round(stage_secs["agreement_and_difference"], 4),
+            "risk_flag_classification": round(stage_secs["risk_flag_classification"], 4),
+            "final_payload_finalize": round(stage_secs["final_payload_finalize"], 4),
         },
         "candidate_build_sec_by_engine": dict(engine_secs),
+        "candidate_build_sec_by_stage_mean": {
+            stage_name: round(elapsed / max(len(rows), 1), 4) for stage_name, elapsed in stage_secs.items()
+        },
         "candidate_refinement_executed_count_by_engine": dict(engine_exec),
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
