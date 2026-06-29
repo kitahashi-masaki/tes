@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 if __package__ is None or __package__ == "":
@@ -46,18 +47,31 @@ else:
 
 BOUNDARY_HINT_RULE_VERSION = "v1"
 _BOUNDARY_HINT_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+_BOUNDARY_HINT_CACHE_LOCK = Lock()
 
 
 def _boundary_hint_key(source: str, text: str) -> tuple[str, str, str]:
     return source, BOUNDARY_HINT_RULE_VERSION, text
 
 
-def _build_boundary_layer_cached(*, source: str, text: str, stats: dict[str, Any]) -> dict[str, Any]:
+def _build_boundary_layer_cached(
+    *,
+    source: str,
+    text: str,
+    stats: dict[str, Any],
+    stats_lock: Lock | None = None,
+) -> dict[str, Any]:
     key = _boundary_hint_key(source, text)
     t0 = time.time()
-    if key in _BOUNDARY_HINT_CACHE:
-        stats["boundary_hint_cache_hit_count_by_source"][source] += 1
-        cached = dict(_BOUNDARY_HINT_CACHE[key])
+    with _BOUNDARY_HINT_CACHE_LOCK:
+        cached_layer = _BOUNDARY_HINT_CACHE.get(key)
+    if cached_layer is not None:
+        if stats_lock is not None:
+            with stats_lock:
+                stats["boundary_hint_cache_hit_count_by_source"][source] += 1
+        else:
+            stats["boundary_hint_cache_hit_count_by_source"][source] += 1
+        cached = dict(cached_layer)
         cached["cache_hit"] = True
         cached["cache_key"] = key
         return cached
@@ -65,11 +79,17 @@ def _build_boundary_layer_cached(*, source: str, text: str, stats: dict[str, Any
     layer = dict(result)
     layer["cache_hit"] = False
     layer["cache_key"] = key
-    _BOUNDARY_HINT_CACHE[key] = dict(layer)
-    stats["boundary_hint_cache_miss_count_by_source"][source] += 1
-    stats["boundary_hint_build_count_by_source"][source] += 1
-    stats["boundary_hint_build_count_by_source"][source] += 0
-    stats["boundary_hint_build_total_sec"] += time.time() - t0
+    with _BOUNDARY_HINT_CACHE_LOCK:
+        _BOUNDARY_HINT_CACHE[key] = dict(layer)
+    if stats_lock is not None:
+        with stats_lock:
+            stats["boundary_hint_cache_miss_count_by_source"][source] += 1
+            stats["boundary_hint_build_count_by_source"][source] += 1
+            stats["boundary_hint_build_total_sec"] += time.time() - t0
+    else:
+        stats["boundary_hint_cache_miss_count_by_source"][source] += 1
+        stats["boundary_hint_build_count_by_source"][source] += 1
+        stats["boundary_hint_build_total_sec"] += time.time() - t0
     return layer
 
 
@@ -172,6 +192,7 @@ def _build_block_payload(
     alignments: dict[str, AlignmentResult],
     candidate_build_mode: str = "staged",
     build_stats: dict[str, Any] | None = None,
+    build_stats_lock: Lock | None = None,
 ) -> tuple[int, dict[str, Any], str]:
     build_stats = build_stats or {}
     sentence_map = {u.sentence_id: u for u in sentence_units}
@@ -180,7 +201,7 @@ def _build_block_payload(
         unit = sentence_map.get(sid)
         if unit is not None:
             boundary_hints.extend(list(getattr(unit, "boundary_hints", []) or []))
-    apple_hint_row = _build_boundary_layer_cached(source="apple", text=block.text, stats=build_stats)
+    apple_hint_row = _build_boundary_layer_cached(source="apple", text=block.text, stats=build_stats, stats_lock=build_stats_lock)
     payload: dict[str, Any] = {
         "episode_id": episode_id,
         "block_id": block.block_id,
@@ -224,7 +245,7 @@ def _build_block_payload(
         qwen_alignment.asr_artifact,
         source="qwen",
     )
-    qwen_layer = _build_boundary_layer_cached(source="qwen", text=qwen_candidate["text"], stats=build_stats)
+    qwen_layer = _build_boundary_layer_cached(source="qwen", text=qwen_candidate["text"], stats=build_stats, stats_lock=build_stats_lock)
     qwen_layer.update(qwen_candidate)
     candidate_rows["qwen"] = qwen_layer
 
@@ -254,7 +275,7 @@ def _build_block_payload(
             alignment.asr_artifact,
             source=engine,
         )
-        candidate_rows[engine] = _build_boundary_layer_cached(source=engine, text=candidate["text"], stats=build_stats)
+        candidate_rows[engine] = _build_boundary_layer_cached(source=engine, text=candidate["text"], stats=build_stats, stats_lock=build_stats_lock)
         candidate_rows[engine].update(candidate)
     payload.update(candidate_rows)
     usable_asr_candidates = {source: row for source, row in candidate_rows.items() if row.get("usable_for_agreement")}
@@ -339,8 +360,8 @@ def build_block_candidates(
     print(f"[block] start episode={episode_id} count={len(alignment_blocks)}", flush=True)
     rows: list[dict[str, Any]] = [None] * len(alignment_blocks)  # type: ignore[list-item]
     quality_counts: dict[str, int] = {}
-    max_workers = workers if workers and workers > 0 else min(4, max(1, (os.cpu_count() or 1)))
-    executor_kind = "thread" if no_parallel else "process"
+    max_workers = 1 if no_parallel else (workers if workers and workers > 0 else min(8, max(1, (os.cpu_count() or 1))))
+    executor_kind = "thread"
     print(f"[block] parallel workers={max_workers} mode={executor_kind} build_mode={candidate_build_mode}", flush=True)
     stage_secs = defaultdict(float)
     engine_secs = defaultdict(float)
@@ -357,91 +378,47 @@ def build_block_candidates(
         "boundary_hint_cache_hit_count_by_source": Counter(),
         "boundary_hint_cache_miss_count_by_source": Counter(),
     }
-    try:
-        if no_parallel:
-            raise PermissionError("parallel disabled")
-        executor_cm = ProcessPoolExecutor(max_workers=max_workers)
-        with executor_cm as executor:
-            futures = {
-                executor.submit(
-                    _build_block_payload,
-                    idx,
-                    block,
-                    episode_id=episode_id,
-                    sentence_units=sentence_units,
-                    apple_artifact=apple_artifact,
-                    alignments=alignments,
-                    candidate_build_mode=candidate_build_mode,
-                    build_stats=build_stats,
-                ): idx
-                for idx, block in enumerate(alignment_blocks, start=1)
-            }
-            completed = 0
-            for future in as_completed(futures):
-                idx, payload, alignment_quality = future.result()
-                rows[idx - 1] = payload
-                quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
-                for engine in ("qwen", "nemotron", "whisper"):
-                    cand = payload.get(engine, {})
-                    if cand.get("skipped"):
-                        engine_skip[engine] += 1
-                    else:
-                        engine_exec[engine] += 1
-                        sr = int(cand.get("search_radius", 0) or 0)
-                        search_radius_sum[engine] += sr
-                        search_radius_max[engine] = max(search_radius_max[engine], sr)
-                        if cand.get("early_exit"):
-                            engine_early_exit[engine] += 1
-                        if cand.get("fallback_expanded"):
-                            fallback_expanded[engine] += 1
-                completed += 1
-                if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
-                    print(
-                        f"[block] progress episode={episode_id} {completed}/{len(alignment_blocks)} block_id={payload['block_id']}",
-                        flush=True,
-                    )
-    except (PermissionError, OSError) as exc:
-        executor_kind = "thread"
-        print(f"[block] process pool unavailable, fallback={executor_kind} reason={type(exc).__name__}", flush=True)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _build_block_payload,
-                    idx,
-                    block,
-                    episode_id=episode_id,
-                    sentence_units=sentence_units,
-                    apple_artifact=apple_artifact,
-                    alignments=alignments,
-                    candidate_build_mode=candidate_build_mode,
-                    build_stats=build_stats,
-                ): idx
-                for idx, block in enumerate(alignment_blocks, start=1)
-            }
-            completed = 0
-            for future in as_completed(futures):
-                idx, payload, alignment_quality = future.result()
-                rows[idx - 1] = payload
-                quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
-                for engine in ("qwen", "nemotron", "whisper"):
-                    cand = payload.get(engine, {})
-                    if cand.get("skipped"):
-                        engine_skip[engine] += 1
-                    else:
-                        engine_exec[engine] += 1
-                        sr = int(cand.get("search_radius", 0) or 0)
-                        search_radius_sum[engine] += sr
-                        search_radius_max[engine] = max(search_radius_max[engine], sr)
-                        if cand.get("early_exit"):
-                            engine_early_exit[engine] += 1
-                        if cand.get("fallback_expanded"):
-                            fallback_expanded[engine] += 1
-                completed += 1
-                if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
-                    print(
-                        f"[block] progress episode={episode_id} {completed}/{len(alignment_blocks)} block_id={payload['block_id']}",
-                        flush=True,
-                    )
+    build_stats_lock = Lock()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _build_block_payload,
+                idx,
+                block,
+                episode_id=episode_id,
+                sentence_units=sentence_units,
+                apple_artifact=apple_artifact,
+                alignments=alignments,
+                candidate_build_mode=candidate_build_mode,
+                build_stats=build_stats,
+                build_stats_lock=build_stats_lock,
+            ): idx
+            for idx, block in enumerate(alignment_blocks, start=1)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            idx, payload, alignment_quality = future.result()
+            rows[idx - 1] = payload
+            quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
+            for engine in ("qwen", "nemotron", "whisper"):
+                cand = payload.get(engine, {})
+                if cand.get("skipped"):
+                    engine_skip[engine] += 1
+                else:
+                    engine_exec[engine] += 1
+                    sr = int(cand.get("search_radius", 0) or 0)
+                    search_radius_sum[engine] += sr
+                    search_radius_max[engine] = max(search_radius_max[engine], sr)
+                    if cand.get("early_exit"):
+                        engine_early_exit[engine] += 1
+                    if cand.get("fallback_expanded"):
+                        fallback_expanded[engine] += 1
+            completed += 1
+            if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
+                print(
+                    f"[block] progress episode={episode_id} {completed}/{len(alignment_blocks)} block_id={payload['block_id']}",
+                    flush=True,
+                )
     total_sec = time.time() - t0
 
     summary = {
@@ -475,6 +452,7 @@ def build_block_candidates(
         "boundary_hint_build_count_by_source": dict(build_stats["boundary_hint_build_count_by_source"]),
         "boundary_hint_cache_hit_count_by_source": dict(build_stats["boundary_hint_cache_hit_count_by_source"]),
         "boundary_hint_cache_miss_count_by_source": dict(build_stats["boundary_hint_cache_miss_count_by_source"]),
+        "candidate_build_executor_kind": executor_kind,
         "parallel_enabled": not no_parallel,
     }
 

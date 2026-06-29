@@ -725,7 +725,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-max-segments", type=int, default=200)
     parser.add_argument("--llm-only-risky", action="store_true")
     parser.add_argument("--candidate-build-mode", choices=["full", "staged", "qwen-only"], default="staged")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--no-parallel", action="store_true")
     return parser
 
