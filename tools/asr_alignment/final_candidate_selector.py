@@ -81,6 +81,11 @@ def _normalize_review_reason(value: Any) -> list[str]:
     return []
 
 
+def _sentence_display_text(text: str, *, short_response_period: bool = True) -> str:
+    normalized = _normalize_display_text(text, short_response_period=short_response_period)
+    return str(normalized.get("display_text", text))
+
+
 _PROTECTED_PREFIXES = (
     "さあ",
     "それ",
@@ -466,6 +471,7 @@ def select_final_candidates(
         final_blocks.append(block_final)
         for sentence_id in segment["sentence_ids"]:
             unit = unit_map[sentence_id]
+            sentence_display_text = _sentence_display_text(unit.text, short_response_period=short_response_period)
             final_rows.append(
                 {
                     "episode_id": episode_id,
@@ -477,6 +483,7 @@ def select_final_candidates(
                     "final_text": final_text,
                     "final_text_raw": final_text_before_cleanup,
                     "final_text_display": punctuation["display_text"],
+                    "sentence_display_text": sentence_display_text,
                     "punctuation_hints": punctuation["punctuation_hints"],
                     "selected_source": selected_source,
                     "selection_method": selection_method,
@@ -564,7 +571,7 @@ def select_final_candidates(
                         "block_id": row["block_id"],
                         "time": row["time"],
                         "raw_text": row["apple_text"],
-                        "display_text": row.get("final_text_display", row["final_text"]),
+                        "display_text": row.get("sentence_display_text", row.get("final_text_display", row["final_text"])),
                         "punctuation_hints": row.get("punctuation_hints", []),
                     },
                     ensure_ascii=False,

@@ -22,6 +22,8 @@ if __package__ is None or __package__ == "":
         ensure_dir,
         classify_qwen_apple_difference,
         raw_span_to_norm_span,
+        _normalize_span_text,
+        _span_similarity,
         refine_local_asr_span,
         save_jsonl,
         summarize_quality,
@@ -38,6 +40,8 @@ else:
         ensure_dir,
         classify_qwen_apple_difference,
         raw_span_to_norm_span,
+        _normalize_span_text,
+        _span_similarity,
         refine_local_asr_span,
         save_jsonl,
         summarize_quality,
@@ -101,6 +105,7 @@ def _extract_candidate(
     engine_artifact,
     *,
     source: str,
+    allow_cheap_accept: bool = False,
 ) -> dict[str, Any]:
     apple_span = max(apple_char_end - apple_char_start, 1)
     search_radius = max(32, min(96, apple_span // 2 + 16))
@@ -113,6 +118,72 @@ def _extract_candidate(
         projected_end = float(max(apple_span, 1))
     projected_start = int(max(0, round(projected_start)))
     projected_end = int(max(projected_start + 1, round(projected_end) + 1))
+
+    initial_char_start, initial_char_end = engine_artifact.raw_span_from_norm_range(projected_start, projected_end)
+    if initial_char_end <= initial_char_start:
+        fallback_start = engine_artifact.norm_index_to_raw_index(projected_start)
+        initial_char_start = int(fallback_start or 0)
+        initial_char_end = min(
+            len(engine_artifact.raw_text),
+            max(initial_char_start + max(len(apple_artifact.raw_text[apple_char_start:apple_char_end]), 1), initial_char_start + 1),
+        )
+    initial_text = engine_artifact.raw_text[initial_char_start:initial_char_end].strip() or engine_artifact.raw_text_from_norm_range(projected_start, projected_end).strip()
+    if not initial_text:
+        initial_text = engine_artifact.raw_text[: min(len(engine_artifact.raw_text), max(2, apple_span))]
+    apple_target = apple_artifact.match_norm_text[apple_norm_start:apple_norm_end]
+    initial_local_alignment_score = max(0.0, min(1.0, _span_similarity(apple_target, initial_text)))
+    span_length_ratio = len(_normalize_span_text(initial_text)) / max(len(_normalize_span_text(apple_target)), 1)
+    boundary_contamination = (
+        not initial_text.strip()
+        or initial_text[:1].isspace()
+        or initial_text[-1:].isspace()
+    )
+    qwen_fast_accept = (
+        allow_cheap_accept
+        and source == "qwen"
+        and initial_local_alignment_score >= 0.94
+        and 0.75 <= span_length_ratio <= 1.35
+        and not boundary_contamination
+        and not alignment.asr_artifact.raw_text[:1].isspace()
+    )
+    if qwen_fast_accept:
+        return {
+            "text": initial_text,
+            "raw_text": initial_text,
+            "alignment_text": initial_text,
+            "boundary_text": initial_text,
+            "display_text": initial_text,
+            "boundary_hints": [],
+            "initial_char_start": initial_char_start,
+            "initial_char_end": initial_char_end,
+            "refined_char_start": initial_char_start,
+            "refined_char_end": initial_char_end,
+            "char_start": initial_char_start,
+            "char_end": initial_char_end,
+            "alignment_score": initial_local_alignment_score,
+            "local_alignment_score": initial_local_alignment_score,
+            "span_is_estimated": False,
+            "span_refined": False,
+            "span_drift_start": 0,
+            "span_drift_end": 0,
+            "boundary_contamination": False,
+            "usable_for_agreement": len(_normalize_span_text(initial_text)) > 2,
+            "unusable_reason": "" if len(_normalize_span_text(initial_text)) > 2 else "too_short",
+            "search_radius": search_radius,
+            "source": source,
+            "search_radius_initial": search_radius,
+            "search_radius_final": search_radius,
+            "fallback_expanded": False,
+            "fallback_expand_reason": [],
+            "early_exit": True,
+            "early_exit_reason": "high_local_alignment",
+            "cheap_span_accept": True,
+            "cheap_span_accept_reason": "high_initial_alignment",
+            "heavy_refinement_skipped": True,
+            "boundary_hint_used_for_boundary_eval": False,
+            "boundary_warning": False,
+            "boundary_warning_reason": [],
+        }
     refined = refine_local_asr_span(
         apple_artifact=apple_artifact,
         asr_artifact=engine_artifact,
@@ -145,6 +216,18 @@ def _extract_candidate(
         "unusable_reason": refined["unusable_reason"],
         "search_radius": search_radius,
         "source": source,
+        "search_radius_initial": search_radius,
+        "search_radius_final": search_radius,
+        "fallback_expanded": False,
+        "fallback_expand_reason": [],
+        "early_exit": bool(refined.get("early_exit")),
+        "early_exit_reason": refined.get("early_exit_reason", ""),
+        "cheap_span_accept": bool(refined.get("cheap_span_accept")),
+        "cheap_span_accept_reason": refined.get("cheap_span_accept_reason", ""),
+        "heavy_refinement_skipped": bool(refined.get("heavy_refinement_skipped")),
+        "boundary_hint_used_for_boundary_eval": False,
+        "boundary_warning": False,
+        "boundary_warning_reason": [],
     }
 
 
@@ -253,6 +336,7 @@ def _build_block_payload(
         block.char_end,
         qwen_alignment.asr_artifact,
         source="qwen",
+        allow_cheap_accept=True,
     )
     stage_secs["qwen_refinement"] += time.perf_counter() - t_stage
     t_stage = time.perf_counter()
@@ -271,14 +355,18 @@ def _build_block_payload(
         skip_support = True
 
     t_stage = time.perf_counter()
+    stage_secs["support_candidate_decision_sec"] += 0.0
     for engine in ("nemotron", "whisper"):
         if skip_support:
+            t_skip = time.perf_counter()
             candidate_rows[engine] = _build_placeholder_candidate(
                 source=engine,
                 reason="qwen_high_confidence" if candidate_build_mode != "qwen-only" else "qwen_only_mode",
                 boundary_hints_available=bool(boundary_hints),
             )
+            stage_secs["support_candidate_skip_sec"] += time.perf_counter() - t_skip
             continue
+        t_refine = time.perf_counter()
         alignment = alignments[engine]
         t_engine = time.perf_counter()
         candidate = _extract_candidate(
@@ -290,10 +378,12 @@ def _build_block_payload(
             source=engine,
         )
         stage_secs[f"{engine}_refinement"] += time.perf_counter() - t_engine
+        stage_secs["support_candidate_refinement_sec"] += time.perf_counter() - t_refine
         t_engine = time.perf_counter()
         candidate_rows[engine] = _build_boundary_layer_cached(source=engine, text=candidate["text"], stats=build_stats, stats_lock=build_stats_lock)
         candidate_rows[engine].update(candidate)
         stage_secs[f"{engine}_boundary_layer"] += time.perf_counter() - t_engine
+        stage_secs["support_candidate_payload_sec"] += 0.0
     stage_secs["support_candidates"] += time.perf_counter() - t_stage
     t_stage = time.perf_counter()
     payload.update(candidate_rows)
@@ -397,6 +487,7 @@ def build_block_candidates(
     engine_early_exit = Counter()
     engine_cheap_accept = Counter()
     engine_heavy_skipped = Counter()
+    engine_early_exit_ids = defaultdict(list)
     fallback_expanded = Counter()
     search_radius_sum = Counter()
     search_radius_max = Counter()
@@ -442,6 +533,7 @@ def build_block_candidates(
                     search_radius_max[engine] = max(search_radius_max[engine], sr)
                     if cand.get("early_exit"):
                         engine_early_exit[engine] += 1
+                        engine_early_exit_ids[engine].append(payload["block_id"])
                     if cand.get("cheap_span_accept"):
                         engine_cheap_accept[engine] += 1
                     if cand.get("heavy_refinement_skipped"):
@@ -474,6 +566,10 @@ def build_block_candidates(
             "nemotron_boundary_layer": round(stage_secs["nemotron_boundary_layer"], 4),
             "whisper_refinement": round(stage_secs["whisper_refinement"], 4),
             "whisper_boundary_layer": round(stage_secs["whisper_boundary_layer"], 4),
+            "support_candidate_decision_sec": round(stage_secs["support_candidate_decision_sec"], 4),
+            "support_candidate_payload_sec": round(stage_secs["support_candidate_payload_sec"], 4),
+            "support_candidate_skip_sec": round(stage_secs["support_candidate_skip_sec"], 4),
+            "support_candidate_refinement_sec": round(stage_secs["support_candidate_refinement_sec"], 4),
             "support_candidates": round(stage_secs["support_candidates"], 4),
             "agreement_and_difference": round(stage_secs["agreement_and_difference"], 4),
             "risk_flag_classification": round(stage_secs["risk_flag_classification"], 4),
@@ -487,6 +583,7 @@ def build_block_candidates(
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
         "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
+        "candidate_refinement_early_exit_block_ids_by_engine": dict(engine_early_exit_ids),
         "cheap_span_accept_count_by_engine": dict(engine_cheap_accept),
         "heavy_refinement_skipped_count_by_engine": dict(engine_heavy_skipped),
         "fallback_expanded_count_by_engine": dict(fallback_expanded),

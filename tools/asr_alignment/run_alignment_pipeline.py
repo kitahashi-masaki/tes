@@ -73,6 +73,21 @@ def _force_clean_output(output_dir: Path) -> None:
         shutil.rmtree(output_dir)
 
 
+def _jsonl_is_valid(path: Path) -> tuple[bool, int]:
+    if not path.exists():
+        return False, 0
+    count = 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            json.loads(line)
+            count += 1
+    except Exception:
+        return False, count
+    return True, count
+
+
 def _install_timed_print() -> None:
     started_at = time.perf_counter()
     original_print = builtins.print
@@ -436,6 +451,10 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- block あたり平均 sentence 数: {summary['avg_sentences_per_block']}")
     lines.append(f"- Apple 安定全文の文字数: {summary['apple_stable_full_text_length']}")
     lines.append(f"- 要確認件数: {summary['needs_review_count']}")
+    lines.append(f"- 要確認件数(final blocks): {summary['needs_review_count_final_blocks']}")
+    lines.append(f"- 要確認件数(normalized blocks): {summary['needs_review_count_normalized_blocks']}")
+    lines.append(f"- review_queue 行数: {summary['review_queue_row_count']}")
+    lines.append(f"- review_queue 単位: {summary['review_queue_unit']}")
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
@@ -449,6 +468,9 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- boundary_hint_used_in_alignment_blocking: {summary['boundary_hint_used_in_alignment_blocking']}")
     lines.append(f"- boundary_hint_used_in_candidate_boundary_eval: {summary['boundary_hint_used_in_candidate_boundary_eval']}")
     lines.append(f"- boundary_hint_used_in_cleanup: {summary['boundary_hint_used_in_cleanup']}")
+    lines.append(f"- sentence_timeline 行数: {summary['sentence_timeline_row_count']}")
+    lines.append(f"- sentence_timeline block leak 件数: {summary['sentence_timeline_display_text_block_leak_count']}")
+    lines.append(f"- sentence_timeline 長すぎる display_text 件数: {summary['sentence_timeline_display_text_too_long_count']}")
     lines.append(f"- 句点補正件数: {summary['punctuation_normalized_count']}")
     lines.append(f"- 句点挿入数: {summary['punctuation_inserted_period_count']}")
     lines.append(f"- 読点挿入数: {summary['punctuation_inserted_comma_count']}")
@@ -467,6 +489,8 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- cleanup による final_text 変更件数: {summary['final_text_changed_by_cleanup_count']}")
     lines.append(f"- final_text_raw == display 件数: {summary['final_text_raw_equals_display_count']}")
     lines.append(f"- final_text_display 変更件数: {summary['final_text_display_changed_count']}")
+    lines.append(f"- 出力検証: {summary.get('output_validation', {})}")
+    lines.append(f"- missing_output_files: {summary.get('missing_output_files', [])}")
     lines.append("")
     lines.append("## 品質")
     for quality, count in summary["alignment_quality_counts"].items():
@@ -723,14 +747,33 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summary.update(block_summary)
     summary["normalized_summary"] = normalized_summary
     summary["alignment_text_used_for_text_score"] = True
+    summary["boundary_text_used_for_windowing"] = True
+    summary["boundary_text_used_for_boundary_score"] = True
     summary["boundary_text_used_for_main_text_score"] = False
     summary["boundary_hints_used_for_boundary_eval"] = bool(summary.get("boundary_hint_used_in_candidate_boundary_eval"))
-    summary["punctuation_hard_matched_as_normal_chars"] = False
+    summary["punctuation_hard_matched_as_normal_chars"] = True
     summary["parallel_enabled"] = not args.no_parallel
     summary["source_level_boundary_hints_available_by_source"] = {"apple": True, "qwen": False, "nemotron": False, "whisper": False}
     summary["candidate_level_boundary_hints_available_by_source"] = {"apple": True, "qwen": True, "nemotron": True, "whisper": True}
     summary["boundary_hints_generated_before_candidate_extraction_by_source"] = {"apple": True, "qwen": False, "nemotron": False, "whisper": False}
     summary["boundary_hints_generated_after_candidate_extraction_by_source"] = {"apple": False, "qwen": True, "nemotron": True, "whisper": True}
+    summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
+    summary["needs_review_count_normalized_blocks"] = sum(1 for row in normalized_rows if row.get("needs_review"))
+    summary["review_queue_row_count"] = len(review_rows)
+    summary["needs_review_count_for_review_queue"] = len(review_rows)
+    summary["review_queue_unit"] = "block"
+    summary["sentence_timeline_row_count"] = len(final_rows)
+    summary["sentence_timeline_display_text_block_leak_count"] = sum(
+        1
+        for row in final_rows
+        if row.get("sentence_display_text") == row.get("final_text_display")
+        and len(str(row.get("sentence_display_text", ""))) >= len(str(row.get("apple_text", ""))) + 8
+    )
+    summary["sentence_timeline_display_text_too_long_count"] = sum(
+        1
+        for row in final_rows
+        if len(str(row.get("sentence_display_text", ""))) > max(80, len(str(row.get("apple_text", ""))) + 24)
+    )
     review_sample_rows = _build_review_sample_rows(normalized_rows)
     review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -742,6 +785,42 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps({"episode_id": episode_id, "input_dir": str(input_dir), "output_dir": str(output_dir), "episode_prefix": episode_prefix, "files": sorted(str(path) for path in source_files.values())}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    required_outputs = {
+        "final_blocks.jsonl": output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl",
+        "final_segments.jsonl": output_dir / "fusion" / f"{episode_id}.final_segments.jsonl",
+        "final_transcript.md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
+        "review_queue.jsonl": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
+        "sentence_timeline.jsonl": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
+        "summary.json": output_dir / "reports" / f"{episode_id}.summary.json",
+        "summary.md": output_dir / "reports" / f"{episode_id}.summary.md",
+        "normalized_summary.json": output_dir / "reports" / f"{episode_id}.normalized_summary.json",
+        "normalized_summary.md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
+        "normalized_block_candidates.jsonl": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
+        "review_sample_blocks.json": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+    }
+    output_validation = {}
+    missing_output_files: list[str] = []
+    for name, path in required_outputs.items():
+        exists = path.exists()
+        valid = exists
+        row_count = None
+        if path.suffix == ".jsonl":
+            valid, row_count = _jsonl_is_valid(path)
+        elif path.suffix == ".json":
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+                valid = True
+            except Exception:
+                valid = False
+        output_validation[name] = {"exists": exists, "valid": valid}
+        if row_count is not None:
+            output_validation[name]["row_count"] = row_count
+        if not valid:
+            missing_output_files.append(name)
+    summary["output_validation"] = output_validation
+    summary["missing_output_files"] = missing_output_files
+    (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
     print(f"[pipeline] end seconds={time.time() - t0:.2f}", flush=True)
     return summary
 
