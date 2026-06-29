@@ -587,6 +587,7 @@ def refine_local_asr_span(
         "len_delta": 10**9,
         "drift": 10**9,
     }
+    early_exit = False
     upper_start = min(window_right, max(0, asr_norm_len - 1))
     for start in range(window_left, upper_start + 1, 2):
         min_end = min(asr_norm_len, max(start + min_len, start + 1))
@@ -614,6 +615,21 @@ def refine_local_asr_span(
                 or (local_score == best["score"] and len_delta == best["len_delta"] and drift == best["drift"] and start < best["start"])
             ):
                 best = {"start": start, "end": end, "score": local_score, "len_delta": len_delta, "drift": drift}
+                span_length_ratio = len(candidate) / max(target_len, 1)
+                boundary_contamination_for_candidate = (
+                    not candidate.strip()
+                    or candidate[:1].isspace()
+                    or candidate[-1:].isspace()
+                )
+                if (
+                    local_score >= 0.96
+                    and 0.75 <= span_length_ratio <= 1.35
+                    and not boundary_contamination_for_candidate
+                ):
+                    early_exit = True
+                    break
+        if early_exit:
+            break
 
     refined_norm_start, refined_norm_end = best["start"], best["end"]
     refined_char_start, refined_char_end = asr_artifact.raw_span_from_norm_range(refined_norm_start, refined_norm_end)
@@ -675,8 +691,8 @@ def refine_local_asr_span(
         "unusable_reason": unusable_reason,
         "initial_text": initial_text,
         "refined_text": refined_text,
-        "early_exit": False,
-        "early_exit_reason": "",
+        "early_exit": early_exit,
+        "early_exit_reason": "high_local_alignment" if early_exit else "",
         "cheap_span_accept": False,
         "cheap_span_accept_reason": "",
         "heavy_refinement_skipped": False,

@@ -88,6 +88,11 @@ def _jsonl_is_valid(path: Path) -> tuple[bool, int]:
     return True, count
 
 
+def _phrase_counts(texts: list[str], phrases: tuple[str, ...]) -> dict[str, int]:
+    joined = "\n".join(str(text or "") for text in texts)
+    return {phrase: joined.count(phrase) for phrase in phrases if phrase in joined}
+
+
 def _install_timed_print() -> None:
     started_at = time.perf_counter()
     original_print = builtins.print
@@ -455,6 +460,7 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 要確認件数(normalized blocks): {summary['needs_review_count_normalized_blocks']}")
     lines.append(f"- review_queue 行数: {summary['review_queue_row_count']}")
     lines.append(f"- review_queue 単位: {summary['review_queue_unit']}")
+    lines.append(f"- review_queue と final_blocks の一致: {summary.get('review_queue_matches_final_blocks')}")
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
@@ -489,6 +495,8 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- cleanup による final_text 変更件数: {summary['final_text_changed_by_cleanup_count']}")
     lines.append(f"- final_text_raw == display 件数: {summary['final_text_raw_equals_display_count']}")
     lines.append(f"- final_text_display 変更件数: {summary['final_text_display_changed_count']}")
+    lines.append(f"- regression_phrase_counts: {summary.get('regression_phrase_counts', {})}")
+    lines.append(f"- domain_error_phrase_counts: {summary.get('domain_error_phrase_counts', {})}")
     lines.append(f"- 出力検証: {summary.get('output_validation', {})}")
     lines.append(f"- missing_output_files: {summary.get('missing_output_files', [])}")
     lines.append("")
@@ -562,6 +570,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         output_dir = Path(args.resume_output_dir).expanduser().resolve()
         print(f"[pipeline] resume from output_dir={output_dir}", flush=True)
         episode_id, apple_timeline, sentence_units, blocks, alignments, block_rows, validation = _load_resume_bundle(output_dir)
+        block_summary_path = output_dir / "normalized" / f"{episode_id}.block_candidates.json"
+        block_summary = read_json_from_path(block_summary_path) if block_summary_path.exists() else {}
         source_files = {Path(path).name: Path(path) for path in apple_timeline.get("source_files", {}).values() if path}
         llm_client = None
         if args.use_llm:
@@ -607,10 +617,76 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             output_dir=output_dir,
         )
         summary["normalized_summary"] = read_json_from_path(output_dir / "reports" / f"{episode_id}.normalized_summary.json") if (output_dir / "reports" / f"{episode_id}.normalized_summary.json").exists() else {}
+        summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
+        summary["needs_review_count_normalized_blocks"] = sum(1 for row in block_rows if row.get("needs_review"))
+        summary["review_queue_row_count"] = len(review_rows)
+        summary["needs_review_count_for_review_queue"] = len(review_rows)
+        summary["review_queue_unit"] = "block"
+        summary["needs_review_count"] = summary["needs_review_count_final_blocks"]
+        summary["review_queue_matches_final_blocks"] = summary["needs_review_count_final_blocks"] == summary["review_queue_row_count"]
+        summary["sentence_timeline_row_count"] = len(final_rows)
+        summary["sentence_timeline_display_text_block_leak_count"] = sum(
+            1
+            for row in final_rows
+            if row.get("sentence_display_text") == row.get("final_text_display")
+            and len(str(row.get("sentence_display_text", ""))) >= len(str(row.get("apple_text", ""))) + 8
+        )
+        summary["sentence_timeline_display_text_too_long_count"] = sum(
+            1
+            for row in final_rows
+            if len(str(row.get("sentence_display_text", ""))) > max(80, len(str(row.get("apple_text", ""))) + 24)
+        )
+        final_texts = [str(row.get("final_text_display", row.get("final_text", ""))) for row in final_blocks]
+        summary["regression_phrase_counts"] = _phrase_counts(
+            final_texts,
+            ("なるほど一体", "8050問題はい", "聞いたことないですか8050問題", "ね。そうですね", "うことです", "のだから"),
+        )
+        summary["domain_error_phrase_counts"] = _phrase_counts(final_texts, ("排水の陣", "各家族", "社会行動", "整形立てて"))
+        required_outputs = {
+            "final_blocks": output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl",
+            "final_segments": output_dir / "fusion" / f"{episode_id}.final_segments.jsonl",
+            "final_transcript_md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
+            "review_queue": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
+            "sentence_timeline": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
+            "summary_json": output_dir / "reports" / f"{episode_id}.summary.json",
+            "summary_md": output_dir / "reports" / f"{episode_id}.summary.md",
+            "normalized_summary_json": output_dir / "reports" / f"{episode_id}.normalized_summary.json",
+            "normalized_summary_md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
+            "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
+            "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+        }
+        output_validation = {}
+        missing_output_files: list[str] = []
+        for name, path in required_outputs.items():
+            exists = path.exists()
+            valid = exists
+            row_count = None
+            if path.suffix == ".jsonl":
+                valid, row_count = _jsonl_is_valid(path)
+                output_validation[name] = {"exists": exists, "jsonl_parse_ok": valid}
+            elif path.suffix == ".json":
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                    valid = True
+                except Exception:
+                    valid = False
+                output_validation[name] = {"exists": exists, "json_parse_ok": valid}
+            else:
+                output_validation[name] = {"exists": exists}
+            if row_count is not None:
+                output_validation[name]["row_count"] = row_count
+            if not valid:
+                missing_output_files.append(name)
+        summary["output_validation"] = output_validation
+        summary["missing_output_files"] = missing_output_files
+        if not summary["review_queue_matches_final_blocks"]:
+            missing_output_files.append("review_queue_count_mismatch")
         summary["review_sample_path"] = str(output_dir / "reports" / f"{episode_id}.review_sample_blocks.json")
         summary["review_sample_count"] = len(review_rows)
         (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
+        if missing_output_files:
+            raise RuntimeError(f"output validation failed: {missing_output_files}")
         print(f"[pipeline] end seconds={time.time() - t0:.2f}", flush=True)
         return summary
     input_dir = Path(args.input_dir).expanduser().resolve()
@@ -762,6 +838,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summary["review_queue_row_count"] = len(review_rows)
     summary["needs_review_count_for_review_queue"] = len(review_rows)
     summary["review_queue_unit"] = "block"
+    summary["needs_review_count"] = summary["needs_review_count_final_blocks"]
+    summary["review_queue_matches_final_blocks"] = summary["needs_review_count_final_blocks"] == summary["review_queue_row_count"]
     summary["sentence_timeline_row_count"] = len(final_rows)
     summary["sentence_timeline_display_text_block_leak_count"] = sum(
         1
@@ -773,6 +851,22 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         1
         for row in final_rows
         if len(str(row.get("sentence_display_text", ""))) > max(80, len(str(row.get("apple_text", ""))) + 24)
+    )
+    final_texts = [str(row.get("final_text_display", row.get("final_text", ""))) for row in final_blocks]
+    summary["regression_phrase_counts"] = _phrase_counts(
+        final_texts,
+        (
+            "なるほど一体",
+            "8050問題はい",
+            "聞いたことないですか8050問題",
+            "ね。そうですね",
+            "うことです",
+            "のだから",
+        ),
+    )
+    summary["domain_error_phrase_counts"] = _phrase_counts(
+        final_texts,
+        ("排水の陣", "各家族", "社会行動", "整形立てて"),
     )
     review_sample_rows = _build_review_sample_rows(normalized_rows)
     review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
@@ -786,17 +880,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         encoding="utf-8",
     )
     required_outputs = {
-        "final_blocks.jsonl": output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl",
-        "final_segments.jsonl": output_dir / "fusion" / f"{episode_id}.final_segments.jsonl",
-        "final_transcript.md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
-        "review_queue.jsonl": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
-        "sentence_timeline.jsonl": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
-        "summary.json": output_dir / "reports" / f"{episode_id}.summary.json",
-        "summary.md": output_dir / "reports" / f"{episode_id}.summary.md",
-        "normalized_summary.json": output_dir / "reports" / f"{episode_id}.normalized_summary.json",
-        "normalized_summary.md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
-        "normalized_block_candidates.jsonl": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
-        "review_sample_blocks.json": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+        "final_blocks": output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl",
+        "final_segments": output_dir / "fusion" / f"{episode_id}.final_segments.jsonl",
+        "final_transcript_md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
+        "review_queue": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
+        "sentence_timeline": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
+        "summary_json": output_dir / "reports" / f"{episode_id}.summary.json",
+        "summary_md": output_dir / "reports" / f"{episode_id}.summary.md",
+        "normalized_summary_json": output_dir / "reports" / f"{episode_id}.normalized_summary.json",
+        "normalized_summary_md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
+        "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
+        "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
     }
     output_validation = {}
     missing_output_files: list[str] = []
@@ -806,21 +900,28 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         row_count = None
         if path.suffix == ".jsonl":
             valid, row_count = _jsonl_is_valid(path)
+            output_validation[name] = {"exists": exists, "jsonl_parse_ok": valid}
         elif path.suffix == ".json":
             try:
                 json.loads(path.read_text(encoding="utf-8"))
                 valid = True
             except Exception:
                 valid = False
-        output_validation[name] = {"exists": exists, "valid": valid}
+            output_validation[name] = {"exists": exists, "json_parse_ok": valid}
+        else:
+            output_validation[name] = {"exists": exists}
         if row_count is not None:
             output_validation[name]["row_count"] = row_count
         if not valid:
             missing_output_files.append(name)
     summary["output_validation"] = output_validation
     summary["missing_output_files"] = missing_output_files
+    if not summary["review_queue_matches_final_blocks"]:
+        missing_output_files.append("review_queue_count_mismatch")
     (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
+    if missing_output_files:
+        raise RuntimeError(f"output validation failed: {missing_output_files}")
     print(f"[pipeline] end seconds={time.time() - t0:.2f}", flush=True)
     return summary
 

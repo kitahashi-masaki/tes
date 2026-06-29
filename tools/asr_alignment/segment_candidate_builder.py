@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -52,6 +53,8 @@ else:
 BOUNDARY_HINT_RULE_VERSION = "v1"
 _BOUNDARY_HINT_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 _BOUNDARY_HINT_CACHE_LOCK = Lock()
+_BOUNDARY_CONTAMINATION_PREFIXES = ("ね。", "うことです", "のだから")
+_DOMAIN_ERROR_PHRASES = ("排水の陣", "各家族", "社会行動", "整形立てて")
 
 
 def _boundary_hint_key(source: str, text: str) -> tuple[str, str, str]:
@@ -97,6 +100,60 @@ def _build_boundary_layer_cached(
     return layer
 
 
+def _numeric_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[0-9０-９]+", text or ""))
+
+
+def _has_numeric_disagreement(left: str, right: str) -> bool:
+    left_tokens = _numeric_tokens(left)
+    right_tokens = _numeric_tokens(right)
+    return bool(left_tokens or right_tokens) and left_tokens != right_tokens
+
+
+def _cheap_local_span(
+    *,
+    apple_target: str,
+    asr_norm_text: str,
+    projected_start: int,
+    projected_end: int,
+    radius: int = 24,
+) -> dict[str, Any]:
+    asr_len = len(asr_norm_text)
+    if asr_len <= 0:
+        return {"start": projected_start, "end": projected_end, "score": 0.0}
+    target_len = max(len(_normalize_span_text(apple_target)), 1)
+    window_left = max(0, projected_start - radius)
+    window_right = min(asr_len, projected_end + radius)
+    min_len = max(1, int(target_len * 0.75))
+    max_len = max(min_len, int(target_len * 1.35))
+    best = {"start": projected_start, "end": projected_end, "score": -1.0, "drift": 10**9}
+    for start in range(window_left, min(window_right, asr_len - 1) + 1, 2):
+        for length in range(min_len, max_len + 1, 2):
+            end = min(asr_len, start + length)
+            if end <= start or end > window_right:
+                continue
+            candidate = asr_norm_text[start:end]
+            text_sim = _span_similarity(apple_target, candidate)
+            len_score = 1.0 - min(1.0, abs(len(candidate) - target_len) / max(target_len, len(candidate), 1))
+            score = max(0.0, min(1.0, 0.82 * text_sim + 0.18 * len_score))
+            drift = abs(start - projected_start) + abs(end - projected_end)
+            if score > best["score"] or (score == best["score"] and drift < best["drift"]):
+                best = {"start": start, "end": end, "score": score, "drift": drift}
+    if best["score"] < 0:
+        best["score"] = 0.0
+    return best
+
+
+def _has_boundary_contamination_suspect(text: str) -> bool:
+    stripped = str(text or "").strip()
+    return any(stripped.startswith(prefix) for prefix in _BOUNDARY_CONTAMINATION_PREFIXES)
+
+
+def _domain_error_phrase_counts(texts: list[str]) -> dict[str, int]:
+    joined = "\n".join(str(text or "") for text in texts)
+    return {phrase: joined.count(phrase) for phrase in _DOMAIN_ERROR_PHRASES if phrase in joined}
+
+
 def _extract_candidate(
     alignment: AlignmentResult,
     apple_artifact,
@@ -119,6 +176,19 @@ def _extract_candidate(
     projected_start = int(max(0, round(projected_start)))
     projected_end = int(max(projected_start + 1, round(projected_end) + 1))
 
+    apple_target = apple_artifact.match_norm_text[apple_norm_start:apple_norm_end]
+    apple_raw_text = apple_artifact.raw_text[apple_char_start:apple_char_end]
+    cheap_span = {"start": projected_start, "end": projected_end, "score": 0.0}
+    if allow_cheap_accept and source == "qwen":
+        cheap_span = _cheap_local_span(
+            apple_target=apple_target,
+            asr_norm_text=engine_artifact.match_norm_text,
+            projected_start=projected_start,
+            projected_end=projected_end,
+        )
+        projected_start = int(cheap_span["start"])
+        projected_end = int(cheap_span["end"])
+
     initial_char_start, initial_char_end = engine_artifact.raw_span_from_norm_range(projected_start, projected_end)
     if initial_char_end <= initial_char_start:
         fallback_start = engine_artifact.norm_index_to_raw_index(projected_start)
@@ -130,13 +200,15 @@ def _extract_candidate(
     initial_text = engine_artifact.raw_text[initial_char_start:initial_char_end].strip() or engine_artifact.raw_text_from_norm_range(projected_start, projected_end).strip()
     if not initial_text:
         initial_text = engine_artifact.raw_text[: min(len(engine_artifact.raw_text), max(2, apple_span))]
-    apple_target = apple_artifact.match_norm_text[apple_norm_start:apple_norm_end]
-    initial_local_alignment_score = max(0.0, min(1.0, _span_similarity(apple_target, initial_text)))
+    initial_local_alignment_score = max(float(cheap_span.get("score", 0.0)), max(0.0, min(1.0, _span_similarity(apple_target, initial_text))))
     span_length_ratio = len(_normalize_span_text(initial_text)) / max(len(_normalize_span_text(apple_target)), 1)
+    initial_diff_type, _, initial_critical = classify_qwen_apple_difference(apple_raw_text, initial_text)
+    initial_numeric_disagreement = _has_numeric_disagreement(apple_raw_text, initial_text)
     boundary_contamination = (
         not initial_text.strip()
         or initial_text[:1].isspace()
         or initial_text[-1:].isspace()
+        or _has_boundary_contamination_suspect(initial_text)
     )
     qwen_fast_accept = (
         allow_cheap_accept
@@ -144,6 +216,9 @@ def _extract_candidate(
         and initial_local_alignment_score >= 0.94
         and 0.75 <= span_length_ratio <= 1.35
         and not boundary_contamination
+        and not initial_numeric_disagreement
+        and not initial_critical
+        and initial_diff_type != "critical"
         and not alignment.asr_artifact.raw_text[:1].isspace()
     )
     if qwen_fast_accept:
@@ -183,6 +258,8 @@ def _extract_candidate(
             "boundary_hint_used_for_boundary_eval": False,
             "boundary_warning": False,
             "boundary_warning_reason": [],
+            "numeric_disagreement": False,
+            "critical_term_disagreement": False,
         }
     refined = refine_local_asr_span(
         apple_artifact=apple_artifact,
@@ -345,17 +422,31 @@ def _build_block_payload(
     candidate_rows["qwen"] = qwen_layer
     stage_secs["qwen_boundary_layer"] += time.perf_counter() - t_stage
 
+    t_stage = time.perf_counter()
+    qwen_diff_type, qwen_similarity, qwen_critical = classify_qwen_apple_difference(block.text, qwen_layer["text"])
+    qwen_numeric_disagreement = _has_numeric_disagreement(block.text, qwen_layer["text"])
+    preliminary_agreement = candidate_agreement_score({"apple": block.text, "qwen": qwen_layer.get("text", "")})
+    preliminary_quality = summarize_quality(
+        min(float(qwen_layer.get("local_alignment_score", 0.0)), float(block.stability_score)),
+        preliminary_agreement,
+        False,
+        False,
+    )
     qwen_high_confidence = (
         qwen_layer.get("local_alignment_score", 0.0) >= 0.92
+        and qwen_similarity >= 0.90
+        and qwen_diff_type in {"none", "surface", "soft_domain"}
+        and not qwen_numeric_disagreement
+        and not qwen_critical
+        and preliminary_quality in {"A", "B"}
         and qwen_layer.get("boundary_contamination") is False
         and qwen_layer.get("usable_for_agreement") is True
     )
     skip_support = candidate_build_mode in {"staged", "qwen-only"} and qwen_high_confidence
     if candidate_build_mode == "qwen-only":
         skip_support = True
+    stage_secs["support_candidate_decision_sec"] += time.perf_counter() - t_stage
 
-    t_stage = time.perf_counter()
-    stage_secs["support_candidate_decision_sec"] += 0.0
     for engine in ("nemotron", "whisper"):
         if skip_support:
             t_skip = time.perf_counter()
@@ -383,17 +474,21 @@ def _build_block_payload(
         candidate_rows[engine] = _build_boundary_layer_cached(source=engine, text=candidate["text"], stats=build_stats, stats_lock=build_stats_lock)
         candidate_rows[engine].update(candidate)
         stage_secs[f"{engine}_boundary_layer"] += time.perf_counter() - t_engine
-        stage_secs["support_candidate_payload_sec"] += 0.0
-    stage_secs["support_candidates"] += time.perf_counter() - t_stage
+        stage_secs["support_candidate_payload_sec"] += time.perf_counter() - t_engine
+    stage_secs["support_candidates"] += (
+        stage_secs["support_candidate_decision_sec"]
+        + stage_secs["support_candidate_payload_sec"]
+        + stage_secs["support_candidate_skip_sec"]
+    )
     t_stage = time.perf_counter()
     payload.update(candidate_rows)
     usable_asr_candidates = {source: row for source, row in candidate_rows.items() if row.get("usable_for_agreement")}
-    candidate_texts = {source: row.get("text", "") for source, row in usable_asr_candidates.items()}
+    candidate_texts = {"apple": block.text}
+    candidate_texts.update({source: row.get("text", "") for source, row in usable_asr_candidates.items()})
     agreement = candidate_agreement_score(candidate_texts)
     usable_scores = [float(row.get("local_alignment_score", row.get("alignment_score", 0.0))) for row in usable_asr_candidates.values()]
     if not usable_scores:
         usable_scores = [float(row.get("local_alignment_score", row.get("alignment_score", 0.0))) for row in candidate_rows.values()]
-    qwen_diff_type, qwen_similarity, qwen_critical = classify_qwen_apple_difference(block.text, candidate_rows["qwen"]["text"])
     stage_secs["agreement_and_difference"] += time.perf_counter() - t_stage
     t_stage = time.perf_counter()
     apple_layer = apple_hint_row
@@ -417,6 +512,17 @@ def _build_block_payload(
     payload["usable_asr_candidates"] = usable_asr_candidates
     payload["alignment_quality"] = alignment_quality
     payload["risk_flags"] = compute_risk_flags(payload)
+    if skip_support:
+        payload["risk_flags"] = [
+            flag for flag in payload["risk_flags"]
+            if flag not in {"nemotron_alignment_low", "whisper_alignment_low", "all_models_disagree"}
+        ]
+    if _has_boundary_contamination_suspect(candidate_rows["qwen"].get("text", "")) or _has_boundary_contamination_suspect(block.text):
+        if "boundary_contamination_suspected" not in payload["risk_flags"]:
+            payload["risk_flags"].append("boundary_contamination_suspected")
+    domain_error_counts = _domain_error_phrase_counts([block.text] + [row.get("text", "") for row in candidate_rows.values()])
+    if domain_error_counts and "domain_error_phrase" not in payload["risk_flags"]:
+        payload["risk_flags"].append("domain_error_phrase")
     stage_secs["risk_flag_classification"] += time.perf_counter() - t_stage
     t_stage = time.perf_counter()
     large_span_drift = any(is_large_span_drift(row) for row in candidate_rows.values())
@@ -434,7 +540,17 @@ def _build_block_payload(
         and "all_models_disagree" not in payload["risk_flags"]
         and (not large_span_drift or qwen_local_alignment >= 0.90)
     )
-    severe_flags = {"all_models_disagree", "numeric_disagreement", "span_too_short", "span_too_long", "qwen_alignment_low", "apple_unstable", "critical_term_disagreement"}
+    severe_flags = {
+        "all_models_disagree",
+        "numeric_disagreement",
+        "span_too_short",
+        "span_too_long",
+        "qwen_alignment_low",
+        "apple_unstable",
+        "critical_term_disagreement",
+        "boundary_contamination_suspected",
+        "domain_error_phrase",
+    }
     payload["needs_review"] = not auto_accept and (
         alignment_quality == "E" or (
             alignment_quality in {"C", "D"} and any(flag in severe_flags for flag in payload["risk_flags"])
@@ -442,6 +558,10 @@ def _build_block_payload(
     )
     payload["auto_accepted"] = not payload["needs_review"]
     payload["candidate_build_mode"] = candidate_build_mode
+    payload["support_candidates_skipped"] = bool(skip_support)
+    payload["support_candidates_skip_reason"] = "qwen_high_confidence" if skip_support and candidate_build_mode != "qwen-only" else ("qwen_only_mode" if skip_support else "")
+    payload["boundary_contamination_suspected"] = "boundary_contamination_suspected" in payload["risk_flags"]
+    payload["domain_error_phrase_counts"] = domain_error_counts
     payload["boundary_hint_used_for_boundary_eval"] = bool(boundary_hints)
     payload["boundary_warning"] = False
     payload["boundary_warning_reason"] = []
@@ -449,8 +569,6 @@ def _build_block_payload(
     payload["qwen"]["search_radius_final"] = payload["qwen"].get("search_radius", 0)
     payload["qwen"]["fallback_expanded"] = False
     payload["qwen"]["fallback_expand_reason"] = []
-    payload["qwen"]["early_exit"] = False
-    payload["qwen"]["early_exit_reason"] = ""
     payload["qwen"]["boundary_hint_used_for_boundary_eval"] = bool(boundary_hints)
     payload["qwen"]["boundary_warning"] = False
     payload["qwen"]["boundary_warning_reason"] = []

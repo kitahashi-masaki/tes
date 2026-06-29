@@ -33,6 +33,11 @@ _OPENING_HINTS = (
 )
 
 _EXPLANATORY_OPENERS = ("というのも", "それに対して", "例えば", "ただ", "だから", "で、", "この時に", "そうすると", "一体", "これ")
+_BOUNDARY_REPLACEMENTS = (
+    ("なるほど一体", "なるほど。一体"),
+    ("8050問題はい", "8050問題。はい"),
+    ("聞いたことないですか8050問題", "聞いたことないですか。8050問題"),
+)
 
 
 @dataclass
@@ -84,6 +89,14 @@ def _normalize_prefix(text: str, short_response_period: bool) -> PunctuationNorm
             before = display
             display = display.replace(marker, f"。{opener}", 1)
             continue
+
+    for before_phrase, after_phrase in _BOUNDARY_REPLACEMENTS:
+        if before_phrase in display:
+            before = display
+            display = display.replace(before_phrase, after_phrase)
+            inserted_period_count += display.count(after_phrase) - before.count(after_phrase)
+            boundary_hint_used_count += 1
+            _add_hint(hints, hint_type="phrase_boundary_period", before=before, after=display, reason="known_conversation_boundary")
 
     return PunctuationNormalizationResult(
         display_text=display,

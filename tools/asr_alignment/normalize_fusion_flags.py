@@ -57,7 +57,17 @@ def normalize_block_candidate_flags(row: dict[str, Any]) -> dict[str, Any]:
     numeric_disagreement = "numeric_disagreement" in (normalized.get("risk_flags") or [])
     span_too_long = "span_too_long" in (normalized.get("risk_flags") or [])
     large_span_drift = "large_span_drift" in (normalized.get("risk_flags") or [])
-    qwen_review_blocker = diff_type in {"critical", "semantic"} or qwen_alignment < 0.82 or numeric_disagreement or span_too_long or (large_span_drift and qwen_alignment < 0.90)
+    boundary_contamination_suspected = "boundary_contamination_suspected" in (normalized.get("risk_flags") or [])
+    domain_error_phrase = "domain_error_phrase" in (normalized.get("risk_flags") or [])
+    qwen_review_blocker = (
+        diff_type in {"critical", "semantic"}
+        or qwen_alignment < 0.82
+        or numeric_disagreement
+        or span_too_long
+        or boundary_contamination_suspected
+        or domain_error_phrase
+        or (large_span_drift and qwen_alignment < 0.90)
+    )
     needs_review = bool(qwen_review_blocker)
     if diff_type in {"none", "surface"}:
         qwen_disagreement = False
@@ -79,6 +89,10 @@ def normalize_block_candidate_flags(row: dict[str, Any]) -> dict[str, Any]:
         risk_flags.append("span_too_long")
     if large_span_drift:
         risk_flags.append("large_span_drift")
+    if boundary_contamination_suspected:
+        risk_flags.append("boundary_contamination_suspected")
+    if domain_error_phrase:
+        risk_flags.append("domain_error_phrase")
     if diff_type == "surface":
         risk_flags.append("surface_difference")
     if qwen_disagreement and "qwen_apple_disagreement" not in risk_flags:

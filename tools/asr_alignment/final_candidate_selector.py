@@ -105,6 +105,12 @@ _LEADING_FRAGMENT_RE = re.compile(r"^(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[�
 _TRAILING_FRAGMENT_RE = re.compile(r"(?:[ぁ-ゖァ-ヶ]{1,2}|[一-龯]{1,2}|[ぁ-ゖァ-ヶ]{1,2}。|[一-龯]{1,2}。|建|実|な|ポイ|入れ|そうす)$")
 _LEAN_VALIDATION_PREFIXES = ("、", "。", "に対して", "を言うと", "の陣", "ほど。", "とです", "うのも", "は家")
 _LEAN_VALIDATION_SUFFIXES = ("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")
+_BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES = ("ね。", "うことです", "のだから")
+
+
+def _has_boundary_contamination_suspect(text: str) -> bool:
+    stripped = str(text or "").strip()
+    return any(stripped.startswith(prefix) for prefix in _BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES)
 
 
 def _cleanup_boundary_fragments(
@@ -424,6 +430,13 @@ def select_final_candidates(
                 if cleanup["boundary_cleanup_applied"] and punctuation["punctuation_hints"]:
                     stats["cleanup_reverted_by_punctuation_hint_count"] += 0
 
+        final_risk_flags = list(segment.get("risk_flags", []) or [])
+        if _has_boundary_contamination_suspect(final_text) or _has_boundary_contamination_suspect(punctuation["display_text"]):
+            needs_review = True
+            review_reason = merge_review_reasons(review_reason, ["boundary_contamination_suspected"])
+            if "boundary_contamination_suspected" not in final_risk_flags:
+                final_risk_flags.append("boundary_contamination_suspected")
+
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
             float(segment_time["start_sec"]),
@@ -445,6 +458,7 @@ def select_final_candidates(
             "confidence": float(confidence),
             "needs_review": needs_review,
             "review_reason": review_reason,
+            "risk_flags": final_risk_flags,
             "candidate_summary": candidate_summary,
             "apple_display_text": candidate_summary.get("apple", ""),
             "apple_boundary_hints": segment_boundary_hints,
@@ -490,6 +504,7 @@ def select_final_candidates(
                     "confidence": float(confidence),
                     "needs_review": needs_review,
                     "review_reason": review_reason,
+                    "risk_flags": final_risk_flags,
                     "candidate_summary": candidate_summary,
                     "apple_display_text": candidate_summary.get("apple", ""),
                     "apple_boundary_hints": segment_boundary_hints,
@@ -523,7 +538,7 @@ def select_final_candidates(
                     "needs_review": needs_review,
                     "review_reason": review_reason,
                     "alignment_quality": segment.get("alignment_quality"),
-                    "risk_flags": segment.get("risk_flags", []),
+                    "risk_flags": final_risk_flags,
                     "candidate_summary": candidate_summary,
                     "final_text": final_text,
                     "selected_source": selected_source,
