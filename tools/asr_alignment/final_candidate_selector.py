@@ -577,6 +577,51 @@ def _human_review_required(
     return human_review_required, sorted(dict.fromkeys(reasons))
 
 
+def _llm_target_reasons(segment: dict[str, Any], final_risk_flags: list[str], final_text: str, selected_source: str) -> list[str]:
+    reasons: list[str] = []
+    flags = set(str(flag) for flag in final_risk_flags)
+    qwen = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+    qwen_alignment = float(qwen.get("local_alignment_score", qwen.get("alignment_score", 0.0)) or 0.0)
+    unusual_patterns = _find_unusual_final_text_patterns(final_text)
+
+    if "numeric_disagreement" in flags:
+        reasons.append("numeric_disagreement")
+    if "critical_term_disagreement" in flags:
+        reasons.append("critical_term_disagreement")
+    if "domain_error_phrase" in flags:
+        reasons.append("domain_error_phrase")
+    if "boundary_contamination_suspected" in flags:
+        reasons.append("boundary_contamination_suspected")
+    if any(item.get("severity") == "human_required" for item in unusual_patterns if isinstance(item, dict)):
+        reasons.append("genuine_unusual_final_text_pattern")
+    if selected_source and selected_source != "apple" and qwen_alignment < 0.82:
+        reasons.append("selected_source_alignment_low")
+    if "qwen_apple_disagreement" in flags and "critical_term_disagreement" in flags:
+        reasons.append("qwen_apple_disagreement_with_critical")
+    return sorted(dict.fromkeys(reasons))
+
+
+def _llm_target_priority(reasons: list[str], segment: dict[str, Any]) -> int:
+    score = 0
+    reason_set = set(reasons)
+    if "numeric_disagreement" in reason_set:
+        score += 600
+    if "critical_term_disagreement" in reason_set:
+        score += 500
+    if "domain_error_phrase" in reason_set:
+        score += 450
+    if "genuine_unusual_final_text_pattern" in reason_set:
+        score += 400
+    if "boundary_contamination_suspected" in reason_set:
+        score += 300
+    if "selected_source_alignment_low" in reason_set:
+        score += 200
+    if "qwen_apple_disagreement_with_critical" in reason_set:
+        score += 50
+    score += max(0, 100 - int(float((segment.get("qwen", {}) or {}).get("local_alignment_score", 0.0) or 0.0) * 100))
+    return score
+
+
 def _cleanup_boundary_fragments(
     final_text: str,
     apple_text: str,
