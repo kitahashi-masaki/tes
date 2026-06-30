@@ -593,6 +593,7 @@ def refine_local_asr_span(
     }
     early_exit = False
     candidate_eval_count = 0
+    candidate_pruned_count = 0
     target_len_for_profile = max_len - min_len
     window_span = max(0, window_right - window_left)
     use_coarse_to_fine = target_len >= 120 or window_span >= 220 or target_len_for_profile >= 80
@@ -601,18 +602,22 @@ def refine_local_asr_span(
     upper_start = min(window_right, max(0, asr_norm_len - 1))
 
     def _score_candidate(start: int, end: int) -> None:
-        nonlocal best, early_exit, candidate_eval_count
+        nonlocal best, early_exit, candidate_eval_count, candidate_pruned_count
         candidate = asr_norm_text[start:end]
         if not candidate.strip():
             return
-        candidate_eval_count += 1
-        text_sim = _match_span_similarity(apple_target, candidate)
         len_score = 1.0 - min(1.0, abs(len(candidate) - target_len) / max(target_len, len(candidate), 1))
         boundary_score = 1.0
         if start <= window_left or end >= window_right:
             boundary_score -= 0.18
         if candidate[:1].isspace() or candidate[-1:].isspace():
             boundary_score -= 0.12
+        max_possible_score = max(0.0, min(1.0, 0.7 + 0.2 * len_score + 0.1 * boundary_score))
+        if max_possible_score < best["score"]:
+            candidate_pruned_count += 1
+            return
+        candidate_eval_count += 1
+        text_sim = _match_span_similarity(apple_target, candidate)
         local_score = max(0.0, min(1.0, 0.7 * text_sim + 0.2 * len_score + 0.1 * boundary_score))
         len_delta = abs(len(candidate) - target_len)
         drift = abs(start - projected_norm_start) + abs(end - projected_norm_end)
@@ -743,6 +748,7 @@ def refine_local_asr_span(
         "heavy_refinement_skipped": False,
         "refinement_search_profile": "coarse_to_fine" if use_coarse_to_fine else "full",
         "refinement_candidate_eval_count": candidate_eval_count,
+        "refinement_candidate_pruned_count": candidate_pruned_count,
         "refinement_window_span": window_span,
         "refinement_target_len": target_len,
     }
