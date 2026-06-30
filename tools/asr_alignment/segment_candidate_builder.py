@@ -771,6 +771,10 @@ def build_block_candidates(
         }
         if specific_stage_sec:
             slowest_dominant_stage_counts[max(specific_stage_sec, key=specific_stage_sec.get)] += 1
+    block_build_time_sum = sum(float(row.get("block_build_total_sec", 0.0) or 0.0) for row in rows)
+    slowest_block_time_sum = sum(float(row.get("block_build_total_sec", 0.0) or 0.0) for row in slowest_blocks)
+    slow_block_threshold_sec = 30.0
+    slow_block_count = sum(1 for row in rows if float(row.get("block_build_total_sec", 0.0) or 0.0) >= slow_block_threshold_sec)
 
     summary = {
         "episode_id": episode_id,
@@ -825,6 +829,11 @@ def build_block_candidates(
         "candidate_build_slowest_blocks": slowest_blocks,
         "candidate_build_slowest_block_ids": [row["block_id"] for row in slowest_blocks],
         "candidate_build_slowest_dominant_stage_counts": dict(slowest_dominant_stage_counts),
+        "candidate_build_block_time_sum": round(block_build_time_sum, 4),
+        "candidate_build_slowest_block_time_sum": round(slowest_block_time_sum, 4),
+        "candidate_build_slowest_block_time_ratio": round(slowest_block_time_sum / max(block_build_time_sum, 1e-9), 4),
+        "candidate_build_slow_block_threshold_sec": slow_block_threshold_sec,
+        "candidate_build_slow_block_count": slow_block_count,
         "workers": max_workers,
         "boundary_hint_build_total_sec": build_stats["boundary_hint_build_total_sec"],
         "boundary_hint_build_count_by_source": dict(build_stats["boundary_hint_build_count_by_source"]),

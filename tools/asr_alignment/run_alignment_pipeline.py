@@ -410,6 +410,11 @@ def _build_summary(
         "candidate_build_slowest_blocks": block_summary.get("candidate_build_slowest_blocks", []),
         "candidate_build_slowest_block_ids": block_summary.get("candidate_build_slowest_block_ids", []),
         "candidate_build_slowest_dominant_stage_counts": block_summary.get("candidate_build_slowest_dominant_stage_counts", {}),
+        "candidate_build_block_time_sum": block_summary.get("candidate_build_block_time_sum"),
+        "candidate_build_slowest_block_time_sum": block_summary.get("candidate_build_slowest_block_time_sum"),
+        "candidate_build_slowest_block_time_ratio": block_summary.get("candidate_build_slowest_block_time_ratio"),
+        "candidate_build_slow_block_threshold_sec": block_summary.get("candidate_build_slow_block_threshold_sec"),
+        "candidate_build_slow_block_count": block_summary.get("candidate_build_slow_block_count"),
         "final_text_equals_apple_text_count": final_text_equals_apple_text_count,
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),
@@ -516,6 +521,12 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- Qwen高信頼skip不可の主理由: {summary.get('qwen_high_confidence_primary_reject_reason_counts', {})}")
     lines.append(f"- 遅いblock ID: {summary.get('candidate_build_slowest_block_ids', [])}")
     lines.append(f"- 遅いblock支配stage: {summary.get('candidate_build_slowest_dominant_stage_counts', {})}")
+    lines.append(f"- 遅いblock時間合計: {summary.get('candidate_build_slowest_block_time_sum')}")
+    lines.append(f"- 遅いblock時間比率: {summary.get('candidate_build_slowest_block_time_ratio')}")
+    lines.append(
+        f"- slow block数(>={summary.get('candidate_build_slow_block_threshold_sec')}s): "
+        f"{summary.get('candidate_build_slow_block_count')}"
+    )
     lines.append(f"- conversation_boundary_hint_stage: {summary['conversation_boundary_hint_stage']}")
     lines.append(f"- boundary_hint_applied_sources: {summary['boundary_hint_applied_sources']}")
     lines.append(f"- boundary_hint_applied_count_by_source: {summary['boundary_hint_applied_count_by_source']}")
