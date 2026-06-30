@@ -696,6 +696,24 @@ def build_block_candidates(
                     flush=True,
                 )
     total_sec = time.time() - t0
+    reject_reason_priority = (
+        "qwen_difference_not_safe",
+        "qwen_critical_term_disagreement",
+        "qwen_numeric_disagreement",
+        "qwen_alignment_lt_0_90",
+        "qwen_apple_similarity_lt_0_88",
+        "qwen_not_usable_for_agreement",
+        "preliminary_quality_not_a_or_b",
+        "qwen_domain_error",
+        "qwen_boundary_contamination",
+    )
+    qwen_high_confidence_primary_reject_reason_counts = Counter()
+    for row in rows:
+        reasons = set(row.get("qwen_high_confidence_reject_reasons", []) or [])
+        for reason in reject_reason_priority:
+            if reason in reasons:
+                qwen_high_confidence_primary_reject_reason_counts[reason] += 1
+                break
     slowest_blocks = sorted(
         (
             {
@@ -717,6 +735,16 @@ def build_block_candidates(
         key=lambda item: item["block_build_total_sec"],
         reverse=True,
     )[:10]
+    slowest_dominant_stage_counts = Counter()
+    for row in slowest_blocks:
+        stage_sec = row.get("stage_sec", {})
+        specific_stage_sec = {
+            name: elapsed
+            for name, elapsed in stage_sec.items()
+            if name not in {"support_candidate_refinement_sec", "support_candidates"}
+        }
+        if specific_stage_sec:
+            slowest_dominant_stage_counts[max(specific_stage_sec, key=specific_stage_sec.get)] += 1
 
     summary = {
         "episode_id": episode_id,
@@ -753,6 +781,7 @@ def build_block_candidates(
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_skipped_reason_counts": dict(skip_reason_counts),
         "qwen_high_confidence_reject_reason_counts": dict(qwen_high_confidence_reject_reason_counts),
+        "qwen_high_confidence_primary_reject_reason_counts": dict(qwen_high_confidence_primary_reject_reason_counts),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
         "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
         "candidate_refinement_early_exit_block_ids_by_engine": dict(engine_early_exit_ids),
@@ -765,6 +794,8 @@ def build_block_candidates(
         "max_search_radius_by_engine": dict(search_radius_max),
         "candidate_build_mode": candidate_build_mode,
         "candidate_build_slowest_blocks": slowest_blocks,
+        "candidate_build_slowest_block_ids": [row["block_id"] for row in slowest_blocks],
+        "candidate_build_slowest_dominant_stage_counts": dict(slowest_dominant_stage_counts),
         "workers": max_workers,
         "boundary_hint_build_total_sec": build_stats["boundary_hint_build_total_sec"],
         "boundary_hint_build_count_by_source": dict(build_stats["boundary_hint_build_count_by_source"]),

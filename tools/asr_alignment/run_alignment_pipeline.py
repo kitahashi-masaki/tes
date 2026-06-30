@@ -399,11 +399,14 @@ def _build_summary(
         "candidate_refinement_skipped_count_by_engine": block_summary.get("candidate_refinement_skipped_count_by_engine", {}),
         "candidate_refinement_skipped_reason_counts": block_summary.get("candidate_refinement_skipped_reason_counts", {}),
         "qwen_high_confidence_reject_reason_counts": block_summary.get("qwen_high_confidence_reject_reason_counts", {}),
+        "qwen_high_confidence_primary_reject_reason_counts": block_summary.get("qwen_high_confidence_primary_reject_reason_counts", {}),
         "candidate_refinement_early_exit_count_by_engine": block_summary.get("candidate_refinement_early_exit_count_by_engine", {}),
         "candidate_refinement_early_exit_block_ids_by_engine": block_summary.get("candidate_refinement_early_exit_block_ids_by_engine", {}),
         "cheap_span_accept_count_by_engine": block_summary.get("cheap_span_accept_count_by_engine", {}),
         "heavy_refinement_skipped_count_by_engine": block_summary.get("heavy_refinement_skipped_count_by_engine", {}),
         "candidate_build_slowest_blocks": block_summary.get("candidate_build_slowest_blocks", []),
+        "candidate_build_slowest_block_ids": block_summary.get("candidate_build_slowest_block_ids", []),
+        "candidate_build_slowest_dominant_stage_counts": block_summary.get("candidate_build_slowest_dominant_stage_counts", {}),
         "final_text_equals_apple_text_count": final_text_equals_apple_text_count,
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),
@@ -504,6 +507,9 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
     lines.append(f"- refinement skip 理由: {summary.get('candidate_refinement_skipped_reason_counts', {})}")
     lines.append(f"- Qwen高信頼skip不可理由: {summary.get('qwen_high_confidence_reject_reason_counts', {})}")
+    lines.append(f"- Qwen高信頼skip不可の主理由: {summary.get('qwen_high_confidence_primary_reject_reason_counts', {})}")
+    lines.append(f"- 遅いblock ID: {summary.get('candidate_build_slowest_block_ids', [])}")
+    lines.append(f"- 遅いblock支配stage: {summary.get('candidate_build_slowest_dominant_stage_counts', {})}")
     lines.append(f"- conversation_boundary_hint_stage: {summary['conversation_boundary_hint_stage']}")
     lines.append(f"- boundary_hint_applied_sources: {summary['boundary_hint_applied_sources']}")
     lines.append(f"- boundary_hint_applied_count_by_source: {summary['boundary_hint_applied_count_by_source']}")
