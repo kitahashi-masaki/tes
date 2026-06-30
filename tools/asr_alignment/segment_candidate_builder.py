@@ -53,6 +53,7 @@ else:
 
 
 BOUNDARY_HINT_RULE_VERSION = "v1"
+SUPPORT_GLOBAL_ALIGNMENT_SKIP_THRESHOLD = 0.70
 _BOUNDARY_HINT_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 _BOUNDARY_HINT_CACHE_LOCK = Lock()
 _BOUNDARY_CONTAMINATION_PREFIXES = ("ね。", "うことです", "のだから")
@@ -492,8 +493,18 @@ def _build_block_payload(
             )
             stage_secs["support_candidate_skip_sec"] += time.perf_counter() - t_skip
             continue
-        t_refine = time.perf_counter()
         alignment = alignments[engine]
+        if float(alignment.global_alignment_score) < SUPPORT_GLOBAL_ALIGNMENT_SKIP_THRESHOLD:
+            t_skip = time.perf_counter()
+            candidate_rows[engine] = _build_placeholder_candidate(
+                source=engine,
+                reason="global_alignment_low",
+                boundary_hints_available=bool(boundary_hints),
+            )
+            candidate_rows[engine]["global_alignment_score"] = float(alignment.global_alignment_score)
+            stage_secs["support_candidate_skip_sec"] += time.perf_counter() - t_skip
+            continue
+        t_refine = time.perf_counter()
         t_engine = time.perf_counter()
         candidate = _extract_candidate(
             alignment,
@@ -842,6 +853,7 @@ def build_block_candidates(
         },
         "max_search_radius_by_engine": dict(search_radius_max),
         "candidate_build_mode": candidate_build_mode,
+        "support_global_alignment_skip_threshold": SUPPORT_GLOBAL_ALIGNMENT_SKIP_THRESHOLD,
         "candidate_build_slowest_blocks": slowest_blocks,
         "candidate_build_slowest_block_ids": [row["block_id"] for row in slowest_blocks],
         "candidate_build_slowest_dominant_stage_counts": dict(slowest_dominant_stage_counts),

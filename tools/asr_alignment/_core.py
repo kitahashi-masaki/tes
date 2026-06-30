@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from bisect import bisect_right
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -433,6 +434,16 @@ def _match_span_similarity(left_match_norm: str, right_match_norm: str) -> float
     return sequence_similarity(left_match_norm, right_match_norm)
 
 
+def _char_overlap_similarity_upper_bound(left_counts: Counter[str], left_len: int, right: str) -> float:
+    if left_len <= 0 and not right:
+        return 1.0
+    if left_len <= 0 or not right:
+        return 0.0
+    right_counts = Counter(right)
+    common = sum(min(count, right_counts.get(ch, 0)) for ch, count in left_counts.items())
+    return min(1.0, (2.0 * common) / max(left_len + len(right), 1))
+
+
 def _extract_anchor_terms(texts: list[str]) -> set[str]:
     normalized_texts = [_normalize_span_text(text) for text in texts if text]
     hits: set[str] = set()
@@ -597,6 +608,7 @@ def refine_local_asr_span(
     target_len_for_profile = max_len - min_len
     window_span = max(0, window_right - window_left)
     use_coarse_to_fine = target_len >= 120 or window_span >= 220 or target_len_for_profile >= 80
+    apple_target_counts = Counter(apple_target)
     start_step = 4 if use_coarse_to_fine else 2
     end_step = 4 if use_coarse_to_fine else 2
     upper_start = min(window_right, max(0, asr_norm_len - 1))
@@ -612,7 +624,8 @@ def refine_local_asr_span(
             boundary_score -= 0.18
         if candidate[:1].isspace() or candidate[-1:].isspace():
             boundary_score -= 0.12
-        max_possible_score = max(0.0, min(1.0, 0.7 + 0.2 * len_score + 0.1 * boundary_score))
+        text_sim_upper_bound = _char_overlap_similarity_upper_bound(apple_target_counts, target_len, candidate)
+        max_possible_score = max(0.0, min(1.0, 0.7 * text_sim_upper_bound + 0.2 * len_score + 0.1 * boundary_score))
         if max_possible_score < best["score"]:
             candidate_pruned_count += 1
             return
@@ -1233,11 +1246,11 @@ def compute_risk_flags(segment_payload: dict[str, Any]) -> list[str]:
     quality = segment_payload.get("alignment_quality", "E")
     if float(apple.get("stability_score", 0.0)) < 0.45:
         flags.append("apple_unstable")
-    if float(qwen.get("alignment_score", 0.0)) < 0.55:
+    if not qwen.get("skipped") and float(qwen.get("alignment_score", 0.0)) < 0.55:
         flags.append("qwen_alignment_low")
-    if float(nemotron.get("alignment_score", 0.0)) < 0.55:
+    if not nemotron.get("skipped") and float(nemotron.get("alignment_score", 0.0)) < 0.55:
         flags.append("nemotron_alignment_low")
-    if float(whisper.get("alignment_score", 0.0)) < 0.55:
+    if not whisper.get("skipped") and float(whisper.get("alignment_score", 0.0)) < 0.55:
         flags.append("whisper_alignment_low")
     qwen_diff_type = segment_payload.get("qwen_apple_difference_type", "semantic")
     if qwen_diff_type in {"critical", "semantic"}:

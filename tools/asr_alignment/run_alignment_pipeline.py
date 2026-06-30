@@ -392,6 +392,7 @@ def _build_summary(
         "final_block_count": len(final_blocks),
         "final_sentence_timeline_count": len(final_rows),
         "candidate_build_wall_sec": block_summary.get("candidate_build_wall_sec", block_summary.get("candidate_build_total_sec")),
+        "support_global_alignment_skip_threshold": block_summary.get("support_global_alignment_skip_threshold"),
         "candidate_build_cumulative_stage_sec": block_summary.get("candidate_build_cumulative_stage_sec"),
         "candidate_build_sec_by_stage": block_summary.get("candidate_build_sec_by_stage", {}),
         "candidate_build_sec_by_stage_mean": block_summary.get("candidate_build_sec_by_stage_mean", {}),
@@ -460,6 +461,7 @@ def _build_summary(
         "auto_accepted_count": auto_accepted_count,
         "auto_accepted_ratio": round(auto_accepted_count / max(len(block_rows), 1), 3),
         "risk_flag_counts": dict(risk_counts.most_common()),
+        "boundary_contamination_suspected_count": risk_counts.get("boundary_contamination_suspected", 0),
         "needs_review_reason_counts": dict(review_reason_counts.most_common()),
         "final_risk_flag_counts": dict(final_risk_flag_counts.most_common()),
         "final_needs_review_reason_counts": dict(final_needs_review_reason_counts.most_common()),
@@ -515,6 +517,7 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
+    lines.append(f"- support global alignment skip 閾値: {summary.get('support_global_alignment_skip_threshold')}")
     lines.append(f"- refinement skip 理由: {summary.get('candidate_refinement_skipped_reason_counts', {})}")
     lines.append(f"- refinement search profile: {summary.get('refinement_search_profile_counts', {})}")
     lines.append(f"- refinement candidate eval 合計: {summary.get('refinement_candidate_eval_sum_by_engine', {})}")
