@@ -363,11 +363,6 @@ _UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED = (
     "火復化した家づくり",
     "倒ブレット",
     "とろびていない",
-    "遠藤和樹",
-    "円道一樹",
-    "遠藤勝樹",
-    "矢野圭三",
-    "ヤノウ",
 )
 _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE = (
     "うのも",
@@ -383,6 +378,11 @@ _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE = (
     "うことです",
     "のだから",
     "野郎",
+    "遠藤和樹",
+    "円道一樹",
+    "遠藤勝樹",
+    "矢野圭三",
+    "ヤノウ",
 )
 _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW = 28
 
@@ -390,27 +390,30 @@ _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW = 28
 def _find_unusual_final_text_patterns(text: str) -> list[dict[str, str]]:
     value = str(text or "")
     patterns: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
     if not value.strip():
         return patterns
-    for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED:
-        severity = "human_required"
-        start = value.find(pattern)
-        if start < 0:
-            continue
-        end = start + len(pattern)
-        key = (pattern, severity)
-        if key in seen:
-            continue
-        seen.add(key)
-        patterns.append(
-            {
-                "pattern_id": pattern,
-                "matched_text": pattern,
-                "context": value[max(0, start - _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW) : min(len(value), end + _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW)],
-                "severity": severity,
-            }
-        )
+    for severity, source_patterns in (
+        ("human_required", _UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED),
+        ("machine_note", _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE),
+    ):
+        seen: set[tuple[str, str]] = set()
+        for pattern in source_patterns:
+            start = value.find(pattern)
+            if start < 0:
+                continue
+            end = start + len(pattern)
+            key = (pattern, severity)
+            if key in seen:
+                continue
+            seen.add(key)
+            patterns.append(
+                {
+                    "pattern_id": pattern,
+                    "matched_text": pattern,
+                    "context": value[max(0, start - _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW) : min(len(value), end + _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW)],
+                    "severity": severity,
+                }
+            )
     return patterns
 
 
@@ -431,6 +434,39 @@ def _unusual_final_text_pattern_level(text: str) -> str | None:
 
 def _has_unusual_final_text_pattern(text: str) -> bool:
     return _unusual_final_text_pattern_level(text) is not None
+
+
+def _final_text_suspicious(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return True
+    return _unusual_final_text_pattern_level(value) is not None
+
+
+def _normalized_no_punct(text: str) -> str:
+    return re.sub(r"[\s、。，．,.!?！？「」『』（）()\-‐‑‒–—…]+", "", str(text or ""))
+
+
+def _llm_final_text_candidate_violation(llm_text: str, candidate_texts: dict[str, str], selected_source: str) -> bool:
+    text = str(llm_text or "").strip()
+    if not text:
+        return True
+    selected_text = str(candidate_texts.get(selected_source) or "") if selected_source else ""
+    if selected_text and _normalized_no_punct(text) == _normalized_no_punct(selected_text):
+        return False
+    normalized = _normalized_no_punct(text)
+    if not normalized:
+        return True
+    candidates = [str(candidate_texts.get(src) or "") for src in ("apple", "qwen", "nemotron", "whisper")]
+    if any(_normalized_no_punct(candidate) == normalized for candidate in candidates if candidate):
+        return False
+    if any(normalized in _normalized_no_punct(candidate) or _normalized_no_punct(candidate) in normalized for candidate in candidates if candidate):
+        return False
+    best_similarity = 0.0
+    for candidate in candidates:
+        if candidate:
+            best_similarity = max(best_similarity, segment_similarity_score(text, candidate))
+    return best_similarity < 0.88
 
 
 def _normalized_review_text(value: Any, fallback: str = "") -> str:
@@ -618,8 +654,6 @@ def _recommended_next_action(block: dict[str, Any]) -> str:
         return "llm_review"
     if block.get("deterministic_resolution_available"):
         return "machine_note"
-    if block.get("selected_source") == "qwen" and "qwen_downgraded_for_trailing_cut" in (block.get("review_reason") or []):
-        return "prefer_apple_or_whisper"
     if block.get("review_level") == "human_required":
         return "human_review"
     if block.get("review_level") == "machine_note":
@@ -984,6 +1018,9 @@ def select_final_candidates(
         "large_span_drift_warning_count": 0,
         "llm_selected_count": 0,
         "llm_resolved_count": 0,
+        "llm_candidate_out_of_set_violation_count": 0,
+        "llm_final_text_accepted_count": 0,
+        "llm_final_text_rejected_count": 0,
         "review_level_counts": {"auto_accept": 0, "machine_note": 0, "human_required": 0},
     }
     previous_end: float | None = None
@@ -1035,20 +1072,40 @@ def select_final_candidates(
             selection_method = "deterministic_qwen_downgraded"
         pre_llm_needs_review = bool(segment.get("needs_review"))
         normalized_needs_review = bool(segment.get("needs_review"))
+        candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
+        final_text_suspicious = _final_text_suspicious(final_text)
+        deterministic_resolution = _deterministic_resolution_decision(
+            {
+                "selected_source": selected_source,
+                "final_risk_flags": list(segment.get("risk_flags") or []),
+                "risk_flags": list(segment.get("risk_flags") or []),
+                "final_text_display": final_text,
+            },
+            candidate_summary,
+            final_text,
+        )
+        llm_candidate = str(segment.get("block_id") or "") in llm_target_block_ids
         llm_selected = False
         llm_resolved = False
         llm_changed_final_text = False
         llm_target = False
+        llm_called = False
+        llm_candidate_out_of_set_violation = False
         review_reason = list(segment.get("risk_flags") or [])
         if qwen_downgrade_reasons:
             review_reason = merge_review_reasons(review_reason, qwen_downgrade_reasons)
         llm_decision: LLMDecision | None = None
         should_call = False
         if use_llm and llm_client is not None:
-            should_call = str(segment.get("block_id") or "") in llm_target_block_ids and llm_client.should_call(segment, only_risky=llm_only_risky)
+            should_call = (
+                llm_candidate
+                and llm_client.should_call(segment, only_risky=llm_only_risky)
+                and not (deterministic_resolution["deterministic_resolution_available"] and not final_text_suspicious)
+            )
             if should_call and risky_calls >= llm_max_segments:
                 should_call = False
             llm_target = should_call
+            llm_called = should_call
         if should_call and llm_client is not None:
             stats["llm_used"] = True
             stats["llm_call_count"] += 1
@@ -1082,12 +1139,26 @@ def select_final_candidates(
                     selection_method = "llm_candidate_selection"
                 if llm_decision.final_text:
                     llm_text = str(llm_decision.final_text).strip()
+                    llm_candidate_out_of_set_violation = _llm_final_text_candidate_violation(llm_text, candidate_summary, selected_source)
+                    if llm_candidate_out_of_set_violation:
+                        stats["llm_candidate_out_of_set_violation_count"] = stats.get("llm_candidate_out_of_set_violation_count", 0) + 1
+                        llm_decision = dataclasses.replace(
+                            llm_decision,
+                            needs_review=True,
+                            review_reason=merge_review_reasons(_normalize_review_reason(llm_decision.review_reason), ["llm_candidate_out_of_set_violation"]),
+                        )
+                        llm_text = ""
+                    elif llm_text:
+                        stats["llm_final_text_accepted_count"] = stats.get("llm_final_text_accepted_count", 0) + 1
                     if llm_text and segment_similarity_score(llm_text, final_text) < 0.95:
                         stats["llm_changed_final_text_count"] += 1
                         llm_changed_final_text = True
                     if llm_text:
                         final_text_raw = llm_text
                         final_text = llm_text
+                    else:
+                        if llm_candidate_out_of_set_violation:
+                            stats["llm_final_text_rejected_count"] = stats.get("llm_final_text_rejected_count", 0) + 1
                 llm_selected = True
                 stats["llm_selected_count"] += 1
                 if llm_decision.needs_review is not None:
@@ -1101,7 +1172,6 @@ def select_final_candidates(
                 failure_reason = llm_decision.error or "llm_failed"
                 review_reason = merge_review_reasons(review_reason, [failure_reason])
 
-        candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
         preferred_source, preferred_text, preferred_reasons = _domain_preferred_source(candidate_rows, selected_source, final_text)
         domain_candidate_switched = False
         if preferred_source != selected_source:
@@ -1289,7 +1359,9 @@ def select_final_candidates(
             "needs_review": needs_review,
             "pre_llm_needs_review": pre_llm_needs_review,
             "normalized_needs_review": normalized_needs_review,
-            "llm_called": bool(should_call),
+            "llm_candidate": llm_candidate,
+            "llm_called": llm_called,
+            "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
             "human_review_required": human_review_required,
             "machine_review_note": machine_review_note,
             "review_level": review_level,
@@ -1451,7 +1523,9 @@ def select_final_candidates(
                     "confidence": float(confidence),
                     "pre_llm_needs_review": pre_llm_needs_review,
                     "normalized_needs_review": normalized_needs_review,
-                    "llm_called": bool(should_call),
+                    "llm_candidate": llm_candidate,
+                    "llm_called": llm_called,
+                    "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
@@ -1485,7 +1559,9 @@ def select_final_candidates(
                     "review_gate_reasons": review_gate_reasons,
                     "machine_note_reasons": machine_note_reasons,
                     "unusual_final_text_patterns": _find_unusual_final_text_patterns(final_text),
-                    "llm_called": bool(should_call),
+                    "llm_candidate": llm_candidate,
+                    "llm_called": llm_called,
+                    "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
@@ -1529,7 +1605,9 @@ def select_final_candidates(
                     "whisper_text": candidate_summary.get("whisper", ""),
                     "candidate_texts": candidate_summary,
                     "unusual_final_text_patterns": _find_unusual_final_text_patterns(final_text),
-                    "llm_called": bool(should_call),
+                    "llm_candidate": llm_candidate,
+                    "llm_called": llm_called,
+                    "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_target": llm_target,
@@ -1543,11 +1621,11 @@ def select_final_candidates(
 
     if use_llm and llm_client is not None:
         stats["llm_target_max_blocks"] = llm_target_max_blocks
-        stats["llm_candidate_block_count"] = llm_candidate_block_count
-        stats["llm_target_block_count"] = len(llm_target_block_ids)
-        stats["llm_skipped_human_required_count"] = max(0, llm_candidate_block_count - len(llm_target_block_ids))
+        stats["llm_candidate_block_count"] = sum(1 for row in final_blocks if row.get("llm_candidate"))
+        stats["llm_target_block_count"] = sum(1 for row in final_blocks if row.get("llm_target"))
+        stats["llm_skipped_human_required_count"] = max(0, stats["llm_candidate_block_count"] - stats["llm_target_block_count"])
         stats["llm_target_selection_reasons"] = dict(llm_target_selection_reasons)
-        stats["llm_target_block_ids"] = list(sorted(llm_target_block_ids))
+        stats["llm_target_block_ids"] = [str(row.get("block_id") or "") for row in final_blocks if row.get("llm_target")]
     else:
         stats["llm_target_max_blocks"] = llm_target_max_blocks
         stats["llm_candidate_block_count"] = 0

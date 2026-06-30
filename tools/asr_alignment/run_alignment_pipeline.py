@@ -813,12 +813,6 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
     unusual_final_text_pattern_human_required_count = 0
     unusual_final_text_pattern_machine_note_count = 0
     review_sample_level_counts = Counter()
-    llm_candidate_block_count = 0
-    llm_target_block_count = 0
-    llm_skipped_human_required_count = 0
-    llm_target_selection_reasons = Counter()
-    llm_target_block_ids: list[str] = []
-    llm_target_max_blocks = 10
     llm_resolved_human_review_count = 0
     llm_kept_human_review_count = 0
     llm_changed_final_text_count = 0
@@ -872,19 +866,6 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
                 unusual_final_text_pattern_human_required_count += 1
             if block.get("machine_review_note"):
                 unusual_final_text_pattern_machine_note_count += 1
-        target_reasons = _target_reasons(block)
-        if block.get("human_review_required"):
-            if target_reasons:
-                llm_candidate_block_count += 1
-                if len(llm_target_block_ids) < llm_target_max_blocks:
-                    llm_target_block_ids.append(str(block.get("block_id") or ""))
-                    llm_target_block_count += 1
-                    for reason in target_reasons:
-                        llm_target_selection_reasons[reason] += 1
-                else:
-                    llm_skipped_human_required_count += 1
-            else:
-                llm_skipped_human_required_count += 1
         if block.get("llm_selected"):
             if block.get("llm_resolved"):
                 llm_resolved_human_review_count += 1
@@ -899,6 +880,15 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
 
     human_review_required_count = sum(1 for row in final_blocks if row.get("human_review_required"))
     review_queue_row_count = len(review_rows)
+    llm_candidate_block_count = sum(1 for row in final_blocks if row.get("llm_candidate"))
+    llm_target_block_count = sum(1 for row in final_blocks if row.get("llm_target"))
+    llm_skipped_human_required_count = max(0, llm_candidate_block_count - llm_target_block_count)
+    llm_target_block_ids = [str(row.get("block_id") or "") for row in final_blocks if row.get("llm_target")]
+    llm_target_selection_reasons = Counter()
+    for row in final_blocks:
+        if row.get("llm_target"):
+            for reason in row.get("review_gate_reasons") or []:
+                llm_target_selection_reasons[str(reason)] += 1
     return {
         "review_queue_row_count": review_queue_row_count,
         "machine_review_notes_row_count": sum(1 for row in final_blocks if row.get("review_level") == "machine_note"),
@@ -912,7 +902,7 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
         "qwen_alignment_low_by_selected_source": dict(qwen_alignment_low_by_selected_source),
         "qwen_alignment_low_human_required_by_selected_source": dict(qwen_alignment_low_human_required_by_selected_source),
         "qwen_alignment_low_machine_note_by_selected_source": dict(qwen_alignment_low_machine_note_by_selected_source),
-        "llm_target_max_blocks": llm_target_max_blocks,
+        "llm_target_max_blocks": 10,
         "llm_candidate_block_count": llm_candidate_block_count,
         "llm_target_block_count": llm_target_block_count,
         "llm_skipped_human_required_count": llm_skipped_human_required_count,
