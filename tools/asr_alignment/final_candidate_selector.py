@@ -312,6 +312,58 @@ def _review_reasons_for_flags(risk_flags: list[str]) -> list[str]:
     return [flag for flag in risk_flags if flag not in ignored_when_auto_safe]
 
 
+def _has_unusual_final_text_pattern(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return True
+    suspicious_patterns = (
+        "うのも",
+        "に対して",
+        "、いや",
+        "ほど。はい",
+        "とです",
+        "を言うと",
+        "の陣",
+        "は家",
+        "ね。そうですね",
+        "うことです",
+        "のだから",
+    )
+    if any(pattern in value for pattern in suspicious_patterns):
+        return True
+    if value.startswith(("、", "。")):
+        return True
+    if value.endswith(("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")):
+        return True
+    return False
+
+
+def _human_review_required(segment: dict[str, Any], final_risk_flags: list[str], final_text: str) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    diff_type = str(segment.get("qwen_apple_difference_type") or "semantic")
+    qwen = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+    qwen_alignment = float(qwen.get("local_alignment_score", qwen.get("alignment_score", 0.0)) or 0.0)
+    severe_flags = {
+        "critical_term_disagreement",
+        "numeric_disagreement",
+        "boundary_contamination_suspected",
+        "span_too_long",
+        "domain_error_phrase",
+    }
+    if any(flag in final_risk_flags for flag in severe_flags):
+        reasons.extend([flag for flag in final_risk_flags if flag in severe_flags])
+    if diff_type in {"critical", "semantic"} and "qwen_apple_disagreement" in final_risk_flags:
+        reasons.append("qwen_apple_disagreement")
+    if diff_type in {"critical", "semantic"} and "qwen_apple_disagreement" not in final_risk_flags:
+        reasons.append("qwen_apple_disagreement")
+    if qwen_alignment < 0.82:
+        reasons.append("qwen_alignment_low")
+    if _has_unusual_final_text_pattern(final_text):
+        reasons.append("unusual_final_text_pattern")
+    human_review_required = bool(reasons)
+    return human_review_required, sorted(dict.fromkeys(reasons))
+
+
 def _cleanup_boundary_fragments(
     final_text: str,
     apple_text: str,
@@ -512,6 +564,8 @@ def select_final_candidates(
         "boundary_suggestion_count": 0,
         "trailing_boundary_suggestion_count": 0,
         "large_span_drift_warning_count": 0,
+        "llm_selected_count": 0,
+        "llm_resolved_count": 0,
     }
     previous_end: float | None = None
     risky_calls = 0
@@ -524,7 +578,10 @@ def select_final_candidates(
         final_text = final_text_raw
         confidence = deterministic["confidence"]
         selection_method = deterministic["selection_method"]
-        needs_review = bool(segment.get("needs_review"))
+        pre_llm_needs_review = bool(segment.get("needs_review"))
+        normalized_needs_review = bool(segment.get("needs_review"))
+        llm_selected = False
+        llm_resolved = False
         review_reason = list(segment.get("risk_flags") or [])
         llm_decision: LLMDecision | None = None
         should_call = False
@@ -570,12 +627,13 @@ def select_final_candidates(
                     if llm_text:
                         final_text_raw = llm_text
                         final_text = llm_text
+                llm_selected = True
+                stats["llm_selected_count"] += 1
                 if llm_decision.needs_review is not None:
-                    if llm_decision.needs_review and not needs_review:
+                    if llm_decision.needs_review and not pre_llm_needs_review:
                         stats["llm_changed_needs_review_true_count"] += 1
-                    if not llm_decision.needs_review and needs_review:
+                    if not llm_decision.needs_review and pre_llm_needs_review:
                         stats["llm_changed_needs_review_false_count"] += 1
-                    needs_review = bool(llm_decision.needs_review)
                 review_reason = merge_review_reasons(review_reason, _normalize_review_reason(llm_decision.review_reason), [llm_decision.notes] if llm_decision.notes else [])
             else:
                 stats["llm_failure_count"] += 1
@@ -630,6 +688,15 @@ def select_final_candidates(
             stats["domain_text_correction_count"] += len(domain_text_corrections)
             review_reason = merge_review_reasons(review_reason, ["domain_text_corrected"])
 
+        candidate_text_similarity = 0.0
+        candidate_texts_for_mix = [str(row.get("text", "") or "") for row in candidate_rows.values() if str(row.get("text", "") or "").strip()]
+        if candidate_texts_for_mix:
+            candidate_text_similarity = max(segment_similarity_score(final_text, candidate_text) for candidate_text in candidate_texts_for_mix)
+        if llm_selected and llm_decision is not None and llm_decision.final_text and candidate_text_similarity < 0.92:
+            final_risk_flags.append("llm_candidate_mix_suspected")
+        if _has_unusual_final_text_pattern(final_text) and "unusual_final_text_pattern" not in final_risk_flags:
+            final_risk_flags.append("unusual_final_text_pattern")
+
         display_source_text = final_text if domain_text_corrected else _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
         punctuation = {
             "display_text": display_source_text,
@@ -657,7 +724,6 @@ def select_final_candidates(
         qwen_alignment_for_review = float(qwen_for_review.get("local_alignment_score", qwen_for_review.get("alignment_score", 0.0)) or 0.0)
         final_risk_flags = _classify_large_span_drift(final_risk_flags, qwen_alignment_for_review)
         if "domain_error_phrase" in final_risk_flags and not _contains_domain_error(final_text) and not _contains_domain_error(punctuation["display_text"]):
-            final_risk_flags = [flag for flag in final_risk_flags if flag != "domain_error_phrase"]
             final_risk_flags.append("domain_error_avoided")
             stats["domain_error_avoided_count"] += 1
         if domain_text_corrected and "domain_text_corrected" not in final_risk_flags:
@@ -665,16 +731,13 @@ def select_final_candidates(
         if "large_span_drift_warning" in final_risk_flags:
             stats["large_span_drift_warning_count"] += 1
         if _has_boundary_contamination_suspect(final_text) or _has_boundary_contamination_suspect(punctuation["display_text"]):
-            needs_review = True
-            review_reason = merge_review_reasons(review_reason, ["boundary_contamination_suspected"])
             if "boundary_contamination_suspected" not in final_risk_flags:
                 final_risk_flags.append("boundary_contamination_suspected")
         if cleanup_needs_review and "boundary_cleanup_needed" not in final_risk_flags:
             final_risk_flags.append("boundary_cleanup_needed")
-        llm_explicit_review = llm_decision is not None and llm_decision.needs_review is not None
-        if not llm_explicit_review:
-            needs_review = _deterministic_needs_review(segment, final_risk_flags, cleanup_needs_review=cleanup_needs_review)
-            review_reason = _review_reasons_for_flags(final_risk_flags) if needs_review else []
+        if llm_selected and selected_source != deterministic["selected_source"]:
+            llm_resolved = True
+            stats["llm_resolved_count"] += 1
         suggested_final_text, suggestion_reasons = _without_leading_fragment_suggestion(final_text, candidate_summary.get("apple", ""))
         if suggested_final_text != final_text:
             stats["suggested_final_text_count"] += 1
@@ -684,12 +747,18 @@ def select_final_candidates(
                 stats["trailing_boundary_suggestion_count"] += 1
             if "boundary_suggestion_available" not in final_risk_flags:
                 final_risk_flags.append("boundary_suggestion_available")
-            needs_review = True
-            review_reason = merge_review_reasons(review_reason, ["boundary_suggestion_available"])
         elif domain_candidate_switched:
             suggested_final_text = final_text
             suggestion_reasons = preferred_reasons
             stats["suggested_final_text_count"] += 1
+
+        human_review_required, human_review_reason = _human_review_required(segment, final_risk_flags, final_text)
+        if suggested_final_text != final_text:
+            human_review_required = True
+            human_review_reason = merge_review_reasons(human_review_reason, ["boundary_suggestion_available"])
+        pre_llm_review_reason = list(review_reason)
+        review_reason = human_review_reason or pre_llm_review_reason
+        needs_review = human_review_required
 
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
@@ -711,6 +780,12 @@ def select_final_candidates(
             "selection_method": selection_method,
             "confidence": float(confidence),
             "needs_review": needs_review,
+            "pre_llm_needs_review": pre_llm_needs_review,
+            "normalized_needs_review": normalized_needs_review,
+            "human_review_required": human_review_required,
+            "human_review_reason": human_review_reason,
+            "llm_selected": llm_selected,
+            "llm_resolved": llm_resolved,
             "review_reason": review_reason,
             "risk_flags": final_risk_flags,
             "suggested_final_text": suggested_final_text,
@@ -763,6 +838,12 @@ def select_final_candidates(
                     "selection_method": selection_method,
                     "confidence": float(confidence),
                     "needs_review": needs_review,
+                    "pre_llm_needs_review": pre_llm_needs_review,
+                    "normalized_needs_review": normalized_needs_review,
+                    "human_review_required": human_review_required,
+                    "human_review_reason": human_review_reason,
+                    "llm_selected": llm_selected,
+                    "llm_resolved": llm_resolved,
                     "review_reason": review_reason,
                     "risk_flags": final_risk_flags,
                     "suggested_final_text": suggested_final_text,

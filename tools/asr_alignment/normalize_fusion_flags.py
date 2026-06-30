@@ -105,6 +105,7 @@ def normalize_block_candidate_flags(row: dict[str, Any]) -> dict[str, Any]:
             "soft_domain_difference": soft,
             "risk_flags": sorted(dict.fromkeys(risk_flags)),
             "needs_review": needs_review,
+            "normalized_needs_review": needs_review,
             "needs_review_reason": sorted(dict.fromkeys(risk_flags if needs_review else [])),
             "auto_accepted": auto_accepted,
         }
@@ -128,6 +129,7 @@ def summarize_normalized(rows: list[dict[str, Any]], *, episode_id: str, output_
         "needs_review_reason_counts": dict(reason_counts.most_common()),
         "auto_accepted_count": sum(1 for row in rows if row.get("auto_accepted")),
         "needs_review_count": sum(1 for row in rows if row.get("needs_review")),
+        "normalized_needs_review_count": sum(1 for row in rows if row.get("normalized_needs_review")),
     }
     ensure_dir(output_dir / "reports")
     (output_dir / "reports" / f"{episode_id}.normalized_summary.json").write_text(
@@ -138,6 +140,7 @@ def summarize_normalized(rows: list[dict[str, Any]], *, episode_id: str, output_
     lines.append(f"- block 数: {summary['block_count']}")
     lines.append(f"- auto_accept 件数: {summary['auto_accepted_count']}")
     lines.append(f"- needs_review 件数: {summary['needs_review_count']}")
+    lines.append(f"- normalized_needs_review 件数: {summary['normalized_needs_review_count']}")
     lines.append("")
     lines.append("## difference_type")
     for k, v in summary["qwen_apple_difference_type_counts"].items():

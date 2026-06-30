@@ -231,7 +231,12 @@ def _build_summary(
     protected_prefix_prevented_cleanup_count = 0
     final_text_changed_by_cleanup_count = 0
     post_cleanup_needs_review_count = 0
+    pre_llm_needs_review_count = 0
     llm_called_block_count = 0
+    llm_selected_count = 0
+    llm_resolved_count = 0
+    human_review_required_count = 0
+    normalized_needs_review_count = 0
     review_reason_char_split_count = 0
     suggested_final_text_count = 0
     boundary_suggestion_count = 0
@@ -328,6 +333,16 @@ def _build_summary(
         selection_method_counts[block.get("selection_method", "unknown")] += 1
         if block.get("llm_used"):
             llm_called_block_count += 1
+        if block.get("llm_selected"):
+            llm_selected_count += 1
+        if block.get("llm_resolved"):
+            llm_resolved_count += 1
+        if block.get("pre_llm_needs_review"):
+            pre_llm_needs_review_count += 1
+        if block.get("normalized_needs_review"):
+            normalized_needs_review_count += 1
+        if block.get("human_review_required"):
+            human_review_required_count += 1
         if block.get("boundary_cleanup_attempted"):
             boundary_cleanup_attempted_count += 1
             boundary_hint_used_in_cleanup = True
@@ -388,8 +403,8 @@ def _build_summary(
     final_needs_review_reason_counts = Counter()
     for block in final_blocks:
         final_risk_flag_counts.update(block.get("risk_flags", []) or [])
-        if block.get("needs_review"):
-            final_needs_review_reason_counts.update(block.get("review_reason", []) or [])
+        if block.get("human_review_required") or block.get("needs_review"):
+            final_needs_review_reason_counts.update(block.get("human_review_reason") or block.get("review_reason", []) or [])
     sentence_units = apple_timeline["apple_sentence_units"]
     blocks = apple_timeline["alignment_blocks"]
     if any(unit.get("boundary_hints") for unit in sentence_units):
@@ -413,6 +428,11 @@ def _build_summary(
         "coverage_ratios": {engine: alignments[engine].coverage_ratio for engine in alignments},
         "alignment_quality_counts": dict(sorted(quality_counts.items())),
         "needs_review_count": sum(1 for row in block_rows if row["needs_review"]),
+        "pre_llm_needs_review_count": pre_llm_needs_review_count,
+        "llm_selected_count": llm_selected_count,
+        "llm_resolved_count": llm_resolved_count,
+        "human_review_required_count": human_review_required_count,
+        "normalized_needs_review_count": normalized_needs_review_count,
         "final_block_count": len(final_blocks),
         "final_sentence_timeline_count": len(final_rows),
         "candidate_build_wall_sec": block_summary.get("candidate_build_wall_sec", block_summary.get("candidate_build_total_sec")),
@@ -672,6 +692,9 @@ def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10)
                 "segment_id": row.get("segment_id"),
                 "alignment_quality": row.get("alignment_quality"),
                 "needs_review": row.get("needs_review"),
+                "pre_llm_needs_review": row.get("pre_llm_needs_review"),
+                "normalized_needs_review": row.get("normalized_needs_review"),
+                "human_review_required": row.get("human_review_required"),
                 "needs_review_reason": row.get("needs_review_reason", []),
                 "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
                 "qwen_apple_similarity": row.get("qwen_apple_similarity"),
