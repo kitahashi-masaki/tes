@@ -41,7 +41,31 @@ def _combined_score(candidate: dict[str, Any], apple_segment: dict[str, Any], so
     apple_stability = float(apple_segment.get("apple", {}).get("stability_score", 0.0))
     source_bonus = {"qwen": 0.08, "apple": 0.05, "nemotron": 0.02, "whisper": 0.0}.get(source, 0.0)
     usable_bonus = 0.04 if candidate.get("usable_for_agreement") else -0.05
-    return min(1.0, 0.56 * alignment + 0.24 * agreement + 0.12 * apple_stability + source_bonus + usable_bonus)
+    risk_penalty = 0.0
+    candidate_text = str(candidate.get("text", "") or "")
+    qwen_similarity = float(apple_segment.get("qwen_apple_similarity", 0.0) or 0.0) if source == "qwen" else 0.0
+    if source != "apple":
+        boundary_suspected = bool(candidate.get("boundary_contamination") or _has_boundary_contamination_suspect(candidate_text))
+        if source != "qwen" and alignment < 0.70:
+            risk_penalty += 0.18
+        elif source != "qwen" and alignment < 0.82:
+            risk_penalty += 0.08
+        elif source == "qwen" and alignment < 0.70 and qwen_similarity < 0.75:
+            risk_penalty += 0.18
+        elif source == "qwen" and alignment < 0.82 and qwen_similarity < 0.75:
+            risk_penalty += 0.08
+        if boundary_suspected:
+            risk_penalty += 0.10
+        if candidate.get("span_too_long") or candidate.get("span_too_short"):
+            risk_penalty += 0.06
+    if source == "qwen":
+        diff_type = str(apple_segment.get("qwen_apple_difference_type") or "")
+        if diff_type in {"critical", "semantic"} and qwen_similarity < 0.50:
+            risk_penalty += 0.20
+        elif diff_type in {"critical", "semantic"} and qwen_similarity < 0.75:
+            risk_penalty += 0.08
+    score = 0.56 * alignment + 0.24 * agreement + 0.12 * apple_stability + source_bonus + usable_bonus - risk_penalty
+    return max(0.0, min(1.0, score))
 
 
 def _best_source(candidate_rows: dict[str, dict[str, Any]], apple_segment: dict[str, Any]) -> str:
