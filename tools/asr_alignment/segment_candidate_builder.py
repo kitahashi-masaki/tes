@@ -371,7 +371,7 @@ def _build_block_payload(
     block: AlignmentBlock,
     *,
     episode_id: str,
-    sentence_units: list[AppleSentenceUnit],
+    block_boundary_hints: dict[str, list[dict[str, Any]]],
     apple_artifact,
     alignments: dict[str, AlignmentResult],
     candidate_build_mode: str = "staged",
@@ -381,13 +381,8 @@ def _build_block_payload(
     build_stats = build_stats or {}
     t_block = time.perf_counter()
     stage_secs = defaultdict(float)
-    sentence_map = {u.sentence_id: u for u in sentence_units}
     t_stage = time.perf_counter()
-    boundary_hints: list[dict[str, Any]] = []
-    for sid in block.sentence_ids:
-        unit = sentence_map.get(sid)
-        if unit is not None:
-            boundary_hints.extend(list(getattr(unit, "boundary_hints", []) or []))
+    boundary_hints: list[dict[str, Any]] = list(block_boundary_hints.get(block.block_id, []))
     stage_secs["sentence_map_and_hints"] += time.perf_counter() - t_stage
     t_stage = time.perf_counter()
     apple_hint_row = _build_boundary_layer_cached(source="apple", text=block.text, stats=build_stats, stats_lock=build_stats_lock)
@@ -657,6 +652,17 @@ def build_block_candidates(
     max_workers = 1 if no_parallel else (workers if workers and workers > 0 else min(8, max(1, (os.cpu_count() or 1))))
     executor_kind = "thread"
     print(f"[block] parallel workers={max_workers} mode={executor_kind} build_mode={candidate_build_mode}", flush=True)
+    t_precompute = time.perf_counter()
+    sentence_map = {unit.sentence_id: unit for unit in sentence_units}
+    block_boundary_hints: dict[str, list[dict[str, Any]]] = {}
+    for block in alignment_blocks:
+        hints: list[dict[str, Any]] = []
+        for sid in block.sentence_ids:
+            unit = sentence_map.get(sid)
+            if unit is not None:
+                hints.extend(list(getattr(unit, "boundary_hints", []) or []))
+        block_boundary_hints[block.block_id] = hints
+    block_hint_precompute_sec = time.perf_counter() - t_precompute
     stage_secs = defaultdict(float)
     engine_secs = defaultdict(float)
     engine_exec = Counter()
@@ -697,7 +703,7 @@ def build_block_candidates(
                 idx,
                 block,
                 episode_id=episode_id,
-                sentence_units=sentence_units,
+                block_boundary_hints=block_boundary_hints,
                 apple_artifact=apple_artifact,
                 alignments=alignments,
                 candidate_build_mode=candidate_build_mode,
@@ -916,6 +922,8 @@ def build_block_candidates(
         "boundary_hint_cache_miss_count_by_source": dict(build_stats["boundary_hint_cache_miss_count_by_source"]),
         "candidate_build_executor_kind": executor_kind,
         "parallel_enabled": not no_parallel,
+        "block_boundary_hint_precompute_sec": round(block_hint_precompute_sec, 4),
+        "block_boundary_hint_precompute_enabled": True,
     }
 
     if output_dir is not None:
