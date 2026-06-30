@@ -250,11 +250,30 @@ def _build_summary(
     short_response_period_count_by_source = Counter()
     boundary_text_generated_count_by_source = Counter()
     display_text_generated_count_by_source = Counter()
+    selected_source_by_block_id = {str(block.get("block_id")): str(block.get("selected_source", "unknown")) for block in final_blocks}
+    selected_refinement_sec_by_engine = Counter()
+    nonselected_refinement_sec_by_engine = Counter()
+    selected_refinement_eval_by_engine = Counter()
+    nonselected_refinement_eval_by_engine = Counter()
+    nonselected_refinement_block_count_by_engine = Counter()
     for row in block_rows:
         risk_counts.update(row.get("risk_flags", []))
+        selected_source_for_block = selected_source_by_block_id.get(str(row.get("block_id")), "unknown")
+        row_stage_sec = row.get("block_build_sec_by_stage", {}) if isinstance(row.get("block_build_sec_by_stage"), dict) else {}
         for source in ("apple", "qwen", "nemotron", "whisper"):
             candidate = row.get(source)
             if isinstance(candidate, dict):
+                if source != "apple":
+                    refinement_sec = float(row_stage_sec.get(f"{source}_refinement", 0.0) or 0.0)
+                    eval_count = int(candidate.get("refinement_candidate_eval_count", 0) or 0)
+                    if selected_source_for_block == source:
+                        selected_refinement_sec_by_engine[source] += refinement_sec
+                        selected_refinement_eval_by_engine[source] += eval_count
+                    else:
+                        nonselected_refinement_sec_by_engine[source] += refinement_sec
+                        nonselected_refinement_eval_by_engine[source] += eval_count
+                        if refinement_sec > 0 or eval_count > 0:
+                            nonselected_refinement_block_count_by_engine[source] += 1
                 hints = list(candidate.get("boundary_hints", []) or [])
                 if hints:
                     boundary_hint_applied_sources.add(source)
@@ -423,6 +442,11 @@ def _build_summary(
         "candidate_build_slowest_block_time_ratio": block_summary.get("candidate_build_slowest_block_time_ratio"),
         "candidate_build_slow_block_threshold_sec": block_summary.get("candidate_build_slow_block_threshold_sec"),
         "candidate_build_slow_block_count": block_summary.get("candidate_build_slow_block_count"),
+        "selected_refinement_sec_by_engine": dict(selected_refinement_sec_by_engine),
+        "nonselected_refinement_sec_by_engine": dict(nonselected_refinement_sec_by_engine),
+        "selected_refinement_eval_by_engine": dict(selected_refinement_eval_by_engine),
+        "nonselected_refinement_eval_by_engine": dict(nonselected_refinement_eval_by_engine),
+        "nonselected_refinement_block_count_by_engine": dict(nonselected_refinement_block_count_by_engine),
         "final_text_equals_apple_text_count": final_text_equals_apple_text_count,
         "selected_source_not_apple_final_equals_apple_count": selected_source_not_apple_final_equals_apple_count,
         "selected_source_counts": dict(selected_source_counts),
@@ -541,6 +565,11 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
         f"- slow block数(>={summary.get('candidate_build_slow_block_threshold_sec')}s): "
         f"{summary.get('candidate_build_slow_block_count')}"
     )
+    lines.append(f"- selected refinement 秒数: {summary.get('selected_refinement_sec_by_engine', {})}")
+    lines.append(f"- non-selected refinement 秒数: {summary.get('nonselected_refinement_sec_by_engine', {})}")
+    lines.append(f"- selected refinement eval 数: {summary.get('selected_refinement_eval_by_engine', {})}")
+    lines.append(f"- non-selected refinement eval 数: {summary.get('nonselected_refinement_eval_by_engine', {})}")
+    lines.append(f"- non-selected refinement block 数: {summary.get('nonselected_refinement_block_count_by_engine', {})}")
     lines.append(f"- conversation_boundary_hint_stage: {summary['conversation_boundary_hint_stage']}")
     lines.append(f"- boundary_hint_applied_sources: {summary['boundary_hint_applied_sources']}")
     lines.append(f"- boundary_hint_applied_count_by_source: {summary['boundary_hint_applied_count_by_source']}")
