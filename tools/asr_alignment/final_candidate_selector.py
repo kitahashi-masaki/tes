@@ -317,6 +317,7 @@ def _has_unusual_final_text_pattern(text: str) -> bool:
     if not value:
         return True
     suspicious_patterns = (
+        "19080年代",
         "うのも",
         "に対して",
         "、いや",
@@ -325,9 +326,20 @@ def _has_unusual_final_text_pattern(text: str) -> bool:
         "を言うと",
         "の陣",
         "は家",
+        "ハウスカーなんです",
+        "火復化した家づくり",
+        "倒ブレット",
+        "とろびていない",
+        "そうしないと思う",
         "ね。そうですね",
         "うことです",
         "のだから",
+        "遠藤和樹",
+        "円道一樹",
+        "遠藤勝樹",
+        "矢野圭三",
+        "ヤノウ",
+        "野郎",
     )
     if any(pattern in value for pattern in suspicious_patterns):
         return True
@@ -336,6 +348,78 @@ def _has_unusual_final_text_pattern(text: str) -> bool:
     if value.endswith(("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")):
         return True
     return False
+
+
+def _classify_review_level(
+    segment: dict[str, Any],
+    final_risk_flags: list[str],
+    final_text: str,
+    *,
+    selected_source: str,
+) -> dict[str, Any]:
+    diff_type = str(segment.get("qwen_apple_difference_type") or "semantic")
+    qwen = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+    qwen_alignment = float(qwen.get("local_alignment_score", qwen.get("alignment_score", 0.0)) or 0.0)
+    reasons = set(final_risk_flags)
+    gate_reasons: list[str] = []
+    note_reasons: list[str] = []
+
+    severe_gate_flags = {
+        "numeric_disagreement",
+        "critical_term_disagreement",
+        "boundary_contamination_suspected",
+        "domain_error_phrase",
+        "unusual_final_text_pattern",
+    }
+    if any(flag in reasons for flag in severe_gate_flags):
+        gate_reasons.extend([flag for flag in final_risk_flags if flag in severe_gate_flags])
+    if diff_type in {"critical", "semantic"} and "qwen_apple_disagreement" in reasons:
+        if any(flag in reasons for flag in {"numeric_disagreement", "critical_term_disagreement", "domain_error_phrase", "unusual_final_text_pattern", "boundary_contamination_suspected"}):
+            gate_reasons.append("qwen_apple_disagreement")
+        else:
+            note_reasons.append("qwen_apple_disagreement")
+    elif "qwen_apple_disagreement" in reasons:
+        note_reasons.append("qwen_apple_disagreement")
+
+    if qwen_alignment < 0.82:
+        if selected_source != "apple":
+            gate_reasons.append("qwen_alignment_low")
+        elif any(flag in reasons for flag in {"numeric_disagreement", "critical_term_disagreement", "domain_error_phrase", "unusual_final_text_pattern"}):
+            gate_reasons.append("qwen_alignment_low")
+        else:
+            note_reasons.append("qwen_alignment_low")
+
+    if "surface_difference" in reasons:
+        note_reasons.append("surface_difference")
+    if "large_span_drift_warning" in reasons or "large_span_drift" in reasons:
+        note_reasons.append("large_span_drift")
+    if "boundary_cleanup_needed" in reasons:
+        note_reasons.append("boundary_cleanup_needed")
+    if "boundary_suggestion_available" in reasons:
+        note_reasons.append("boundary_suggestion_available")
+
+    if diff_type in {"critical", "semantic"}:
+        note_reasons.append("qwen_apple_disagreement")
+
+    human_required = bool(gate_reasons)
+    machine_note = bool(note_reasons) and not human_required
+    if human_required:
+        review_level = "human_required"
+        priority = "high"
+    elif machine_note:
+        review_level = "machine_note"
+        priority = "low" if len(note_reasons) <= 2 else "medium"
+    else:
+        review_level = "auto_accept"
+        priority = "none"
+    return {
+        "review_level": review_level,
+        "human_review_required": human_required,
+        "machine_review_note": machine_note,
+        "review_priority": priority,
+        "review_gate_reasons": sorted(dict.fromkeys(gate_reasons)),
+        "machine_note_reasons": sorted(dict.fromkeys(note_reasons)),
+    }
 
 
 def _human_review_required(segment: dict[str, Any], final_risk_flags: list[str], final_text: str) -> tuple[bool, list[str]]:
@@ -540,6 +624,7 @@ def select_final_candidates(
     final_rows: list[dict[str, Any]] = []
     final_blocks: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
+    machine_review_rows: list[dict[str, Any]] = []
     stats = {
         "llm_used": False,
         "llm_call_count": 0,
@@ -566,6 +651,7 @@ def select_final_candidates(
         "large_span_drift_warning_count": 0,
         "llm_selected_count": 0,
         "llm_resolved_count": 0,
+        "review_level_counts": {"auto_accept": 0, "machine_note": 0, "human_required": 0},
     }
     previous_end: float | None = None
     risky_calls = 0
@@ -688,6 +774,11 @@ def select_final_candidates(
             stats["domain_text_correction_count"] += len(domain_text_corrections)
             review_reason = merge_review_reasons(review_reason, ["domain_text_corrected"])
 
+        final_risk_flags = list(segment.get("risk_flags", []) or [])
+        qwen_for_review = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+        qwen_alignment_for_review = float(qwen_for_review.get("local_alignment_score", qwen_for_review.get("alignment_score", 0.0)) or 0.0)
+        final_risk_flags = _classify_large_span_drift(final_risk_flags, qwen_alignment_for_review)
+
         candidate_text_similarity = 0.0
         candidate_texts_for_mix = [str(row.get("text", "") or "") for row in candidate_rows.values() if str(row.get("text", "") or "").strip()]
         if candidate_texts_for_mix:
@@ -719,10 +810,6 @@ def select_final_candidates(
                 if cleanup["boundary_cleanup_applied"] and punctuation["punctuation_hints"]:
                     stats["cleanup_reverted_by_punctuation_hint_count"] += 0
 
-        final_risk_flags = list(segment.get("risk_flags", []) or [])
-        qwen_for_review = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
-        qwen_alignment_for_review = float(qwen_for_review.get("local_alignment_score", qwen_for_review.get("alignment_score", 0.0)) or 0.0)
-        final_risk_flags = _classify_large_span_drift(final_risk_flags, qwen_alignment_for_review)
         if "domain_error_phrase" in final_risk_flags and not _contains_domain_error(final_text) and not _contains_domain_error(punctuation["display_text"]):
             final_risk_flags.append("domain_error_avoided")
             stats["domain_error_avoided_count"] += 1
@@ -735,6 +822,18 @@ def select_final_candidates(
                 final_risk_flags.append("boundary_contamination_suspected")
         if cleanup_needs_review and "boundary_cleanup_needed" not in final_risk_flags:
             final_risk_flags.append("boundary_cleanup_needed")
+        review_classification = _classify_review_level(
+            segment,
+            final_risk_flags,
+            final_text,
+            selected_source=selected_source,
+        )
+        human_review_required = bool(review_classification["human_review_required"])
+        machine_review_note = bool(review_classification["machine_review_note"])
+        review_level = str(review_classification["review_level"])
+        review_priority = str(review_classification["review_priority"])
+        review_gate_reasons = list(review_classification["review_gate_reasons"])
+        machine_note_reasons = list(review_classification["machine_note_reasons"])
         if llm_selected and selected_source != deterministic["selected_source"]:
             llm_resolved = True
             stats["llm_resolved_count"] += 1
@@ -752,13 +851,22 @@ def select_final_candidates(
             suggestion_reasons = preferred_reasons
             stats["suggested_final_text_count"] += 1
 
-        human_review_required, human_review_reason = _human_review_required(segment, final_risk_flags, final_text)
         if suggested_final_text != final_text:
-            human_review_required = True
-            human_review_reason = merge_review_reasons(human_review_reason, ["boundary_suggestion_available"])
-        pre_llm_review_reason = list(review_reason)
-        review_reason = human_review_reason or pre_llm_review_reason
+            review_gate_reasons = merge_review_reasons(review_gate_reasons, ["boundary_suggestion_available"])
+            if not human_review_required:
+                machine_review_note = True
+                review_level = "machine_note"
+                review_priority = "low"
+                machine_note_reasons = merge_review_reasons(machine_note_reasons, ["boundary_suggestion_available"])
+        human_review_reason = review_gate_reasons
+        if human_review_required:
+            review_reason = human_review_reason
+        elif machine_review_note:
+            review_reason = machine_note_reasons
+        else:
+            review_reason = []
         needs_review = human_review_required
+        stats["review_level_counts"][review_level] += 1
 
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
@@ -783,6 +891,11 @@ def select_final_candidates(
             "pre_llm_needs_review": pre_llm_needs_review,
             "normalized_needs_review": normalized_needs_review,
             "human_review_required": human_review_required,
+            "machine_review_note": machine_review_note,
+            "review_level": review_level,
+            "review_priority": review_priority,
+            "review_gate_reasons": review_gate_reasons,
+            "machine_note_reasons": machine_note_reasons,
             "human_review_reason": human_review_reason,
             "llm_selected": llm_selected,
             "llm_resolved": llm_resolved,
@@ -841,6 +954,11 @@ def select_final_candidates(
                     "pre_llm_needs_review": pre_llm_needs_review,
                     "normalized_needs_review": normalized_needs_review,
                     "human_review_required": human_review_required,
+                    "machine_review_note": machine_review_note,
+                    "review_level": review_level,
+                    "review_priority": review_priority,
+                    "review_gate_reasons": review_gate_reasons,
+                    "machine_note_reasons": machine_note_reasons,
                     "human_review_reason": human_review_reason,
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
@@ -875,7 +993,7 @@ def select_final_candidates(
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
-        if needs_review:
+        if human_review_required:
             review_rows.append(
                 {
                     "episode_id": episode_id,
@@ -915,6 +1033,34 @@ def select_final_candidates(
                     "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
                     "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
                     "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
+                    "review_level": review_level,
+                    "review_priority": review_priority,
+                    "review_gate_reasons": review_gate_reasons,
+                    "machine_note_reasons": machine_note_reasons,
+                }
+            )
+        elif machine_review_note:
+            machine_review_rows.append(
+                {
+                    "episode_id": episode_id,
+                    "block_id": segment["block_id"],
+                    "sentence_ids": segment["sentence_ids"],
+                    "time": segment_time,
+                    "review_level": review_level,
+                    "review_priority": review_priority,
+                    "machine_review_note": machine_review_note,
+                    "machine_note_reasons": machine_note_reasons,
+                    "review_gate_reasons": review_gate_reasons,
+                    "needs_review": False,
+                    "human_review_required": False,
+                    "normalized_needs_review": normalized_needs_review,
+                    "pre_llm_needs_review": pre_llm_needs_review,
+                    "selected_source": selected_source,
+                    "confidence": float(confidence),
+                    "risk_flags": final_risk_flags,
+                    "candidate_summary": candidate_summary,
+                    "final_text": final_text,
+                    "final_text_display": punctuation["display_text"],
                 }
             )
 
@@ -923,6 +1069,7 @@ def select_final_candidates(
         save_jsonl(output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl", final_blocks)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.final_segments.jsonl", final_rows)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.review_queue.jsonl", review_rows)
+        save_jsonl(output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl", machine_review_rows)
         transcript_lines = [f"# {episode_id}", ""]
         for row in final_blocks:
             start = row["time"]["start_sec"]
@@ -947,4 +1094,7 @@ def select_final_candidates(
             )
         (output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl").write_text("\n".join(sentence_timeline_lines) + ("\n" if sentence_timeline_lines else ""), encoding="utf-8")
 
+    stats["machine_review_note_count"] = len(machine_review_rows)
+    stats["human_review_required_count"] = len(review_rows)
+    stats["auto_accept_final_count"] = sum(1 for row in final_blocks if row.get("review_level") == "auto_accept")
     return final_blocks, final_rows, review_rows, stats

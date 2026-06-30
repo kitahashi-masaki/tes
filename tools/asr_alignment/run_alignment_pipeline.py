@@ -401,10 +401,12 @@ def _build_summary(
             review_reason_char_split_count += 1
     final_risk_flag_counts = Counter()
     final_needs_review_reason_counts = Counter()
+    review_level_counts = Counter()
     for block in final_blocks:
         final_risk_flag_counts.update(block.get("risk_flags", []) or [])
         if block.get("human_review_required") or block.get("needs_review"):
             final_needs_review_reason_counts.update(block.get("human_review_reason") or block.get("review_reason", []) or [])
+        review_level_counts[str(block.get("review_level") or "auto_accept")] += 1
     sentence_units = apple_timeline["apple_sentence_units"]
     blocks = apple_timeline["alignment_blocks"]
     if any(unit.get("boundary_hints") for unit in sentence_units):
@@ -435,6 +437,7 @@ def _build_summary(
         "normalized_needs_review_count": normalized_needs_review_count,
         "final_block_count": len(final_blocks),
         "final_sentence_timeline_count": len(final_rows),
+        "review_level_counts": dict(review_level_counts),
         "candidate_build_wall_sec": block_summary.get("candidate_build_wall_sec", block_summary.get("candidate_build_total_sec")),
         "support_global_alignment_skip_threshold": block_summary.get("support_global_alignment_skip_threshold"),
         "candidate_build_cumulative_stage_sec": block_summary.get("candidate_build_cumulative_stage_sec"),
@@ -562,9 +565,14 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 要確認件数: {summary['needs_review_count']}")
     lines.append(f"- 要確認件数(final blocks): {summary['needs_review_count_final_blocks']}")
     lines.append(f"- 要確認件数(normalized blocks): {summary['needs_review_count_normalized_blocks']}")
+    lines.append(f"- human_review_required 件数: {summary.get('human_review_required_count', 0)}")
+    lines.append(f"- machine_review_note 件数: {summary.get('machine_review_note_count', 0)}")
+    lines.append(f"- auto_accept_final 件数: {summary.get('auto_accept_final_count', 0)}")
     lines.append(f"- review_queue 行数: {summary['review_queue_row_count']}")
+    lines.append(f"- machine_review_notes 行数: {summary.get('machine_review_notes_row_count', 0)}")
     lines.append(f"- review_queue 単位: {summary['review_queue_unit']}")
-    lines.append(f"- review_queue と final_blocks の一致: {summary.get('review_queue_matches_final_blocks')}")
+    lines.append(f"- review_queue と human_review_required の一致: {summary.get('review_queue_matches_human_review_required')}")
+    lines.append(f"- review_level_counts: {summary.get('review_level_counts', {})}")
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
@@ -682,7 +690,7 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
 
 
 def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
-    review_rows = [row for row in block_rows if row.get("needs_review")]
+    review_rows = [row for row in block_rows if row.get("human_review_required")]
     sample_rows: list[dict[str, Any]] = []
     for row in review_rows[:limit]:
         sample_rows.append(
@@ -695,6 +703,11 @@ def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10)
                 "pre_llm_needs_review": row.get("pre_llm_needs_review"),
                 "normalized_needs_review": row.get("normalized_needs_review"),
                 "human_review_required": row.get("human_review_required"),
+                "machine_review_note": row.get("machine_review_note"),
+                "review_level": row.get("review_level"),
+                "review_priority": row.get("review_priority"),
+                "review_gate_reasons": row.get("review_gate_reasons", []),
+                "machine_note_reasons": row.get("machine_note_reasons", []),
                 "needs_review_reason": row.get("needs_review_reason", []),
                 "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
                 "qwen_apple_similarity": row.get("qwen_apple_similarity"),
@@ -765,11 +778,16 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         summary["normalized_summary"] = read_json_from_path(output_dir / "reports" / f"{episode_id}.normalized_summary.json") if (output_dir / "reports" / f"{episode_id}.normalized_summary.json").exists() else {}
         summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
         summary["needs_review_count_normalized_blocks"] = sum(1 for row in block_rows if row.get("needs_review"))
+        summary["human_review_required_count"] = sum(1 for row in final_blocks if row.get("human_review_required"))
+        summary["machine_review_note_count"] = sum(1 for row in final_blocks if row.get("machine_review_note"))
+        summary["auto_accept_final_count"] = sum(1 for row in final_blocks if row.get("review_level") == "auto_accept")
         summary["review_queue_row_count"] = len(review_rows)
+        summary["machine_review_notes_row_count"] = sum(1 for row in final_blocks if row.get("review_level") == "machine_note")
         summary["needs_review_count_for_review_queue"] = len(review_rows)
         summary["review_queue_unit"] = "block"
-        summary["needs_review_count"] = summary["needs_review_count_final_blocks"]
-        summary["review_queue_matches_final_blocks"] = summary["needs_review_count_final_blocks"] == summary["review_queue_row_count"]
+        summary["needs_review_count"] = summary["human_review_required_count"]
+        summary["review_queue_matches_human_review_required"] = summary["human_review_required_count"] == summary["review_queue_row_count"]
+        summary["review_queue_matches_final_blocks"] = summary["review_queue_matches_human_review_required"]
         summary["sentence_timeline_row_count"] = len(final_rows)
         summary["sentence_timeline_display_text_block_leak_count"] = sum(
             1
@@ -793,6 +811,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "final_segments": output_dir / "fusion" / f"{episode_id}.final_segments.jsonl",
             "final_transcript_md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
             "review_queue": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
+            "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
             "sentence_timeline": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
             "summary_json": output_dir / "reports" / f"{episode_id}.summary.json",
             "summary_md": output_dir / "reports" / f"{episode_id}.summary.md",
@@ -825,7 +844,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 missing_output_files.append(name)
         summary["output_validation"] = output_validation
         summary["missing_output_files"] = missing_output_files
-        if not summary["review_queue_matches_final_blocks"]:
+        if not summary["review_queue_matches_human_review_required"]:
             missing_output_files.append("review_queue_count_mismatch")
         summary["review_sample_path"] = str(output_dir / "reports" / f"{episode_id}.review_sample_blocks.json")
         summary["review_sample_count"] = len(review_rows)
@@ -981,11 +1000,16 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summary["boundary_hints_generated_after_candidate_extraction_by_source"] = {"apple": False, "qwen": True, "nemotron": True, "whisper": True}
     summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
     summary["needs_review_count_normalized_blocks"] = sum(1 for row in normalized_rows if row.get("needs_review"))
+    summary["human_review_required_count"] = sum(1 for row in final_blocks if row.get("human_review_required"))
+    summary["machine_review_note_count"] = sum(1 for row in final_blocks if row.get("machine_review_note"))
+    summary["auto_accept_final_count"] = sum(1 for row in final_blocks if row.get("review_level") == "auto_accept")
     summary["review_queue_row_count"] = len(review_rows)
+    summary["machine_review_notes_row_count"] = sum(1 for row in final_blocks if row.get("review_level") == "machine_note")
     summary["needs_review_count_for_review_queue"] = len(review_rows)
     summary["review_queue_unit"] = "block"
-    summary["needs_review_count"] = summary["needs_review_count_final_blocks"]
-    summary["review_queue_matches_final_blocks"] = summary["needs_review_count_final_blocks"] == summary["review_queue_row_count"]
+    summary["needs_review_count"] = summary["human_review_required_count"]
+    summary["review_queue_matches_human_review_required"] = summary["human_review_required_count"] == summary["review_queue_row_count"]
+    summary["review_queue_matches_final_blocks"] = summary["review_queue_matches_human_review_required"]
     summary["sentence_timeline_row_count"] = len(final_rows)
     summary["sentence_timeline_display_text_block_leak_count"] = sum(
         1
@@ -1014,7 +1038,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         final_texts,
         ("排水の陣", "各家族", "社会行動", "整形立てて"),
     )
-    review_sample_rows = _build_review_sample_rows(normalized_rows)
+    review_sample_rows = _build_review_sample_rows(final_blocks)
     review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["review_sample_path"] = str(review_sample_path)
@@ -1037,6 +1061,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "normalized_summary_md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
         "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
         "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+        "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
     }
     output_validation = {}
     missing_output_files: list[str] = []
