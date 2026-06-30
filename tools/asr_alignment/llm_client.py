@@ -111,19 +111,27 @@ class LLMClient:
     def should_call(self, segment_payload: dict[str, Any], *, only_risky: bool) -> bool:
         if only_risky and not segment_payload.get("needs_review"):
             return False
-        quality = segment_payload.get("alignment_quality")
-        difference_type = segment_payload.get("qwen_apple_difference_type")
-        if quality == "E":
-            return True
-        if difference_type in {"critical", "semantic"}:
-            return True
+        flags = set(str(flag) for flag in (segment_payload.get("risk_flags") or []))
+        review_gate_reasons = set(str(reason) for reason in (segment_payload.get("review_gate_reasons") or []))
+        unusual_patterns = segment_payload.get("unusual_final_text_patterns") or []
+        selected_source = str(segment_payload.get("selected_source") or "")
+        selected_source_alignment_low = bool(segment_payload.get("selected_source_alignment_low"))
+        selected_alignment = float(segment_payload.get("selected_source_alignment_score", 0.0) or 0.0)
         if segment_payload.get("numeric_disagreement"):
             return True
-        if segment_payload.get("needs_review"):
+        if "critical_term_disagreement" in flags:
             return True
-        agreement = float(segment_payload.get("candidate_agreement_score", 1.0))
-        flags = segment_payload.get("risk_flags") or []
-        return quality in {"B", "C", "D"} and (agreement < 0.85 or bool(flags))
+        if "domain_error_phrase" in flags:
+            return True
+        if "boundary_contamination_suspected" in flags:
+            return True
+        if any((isinstance(item, dict) and item.get("severity") == "human_required") for item in unusual_patterns):
+            return True
+        if selected_source and selected_source != "apple" and (selected_source_alignment_low or selected_alignment < 0.82):
+            return True
+        if "numeric_disagreement" in review_gate_reasons or "critical_term_disagreement" in review_gate_reasons:
+            return True
+        return False
 
     def _build_prompt(self, segment_payload: dict[str, Any]) -> dict[str, Any]:
         candidate_summary = {
@@ -146,8 +154,11 @@ class LLMClient:
             f"segment_id: {segment_payload['segment_id']}\n"
             f"time: {segment_payload['time']}\n"
             f"risk_flags: {segment_payload.get('risk_flags', [])}\n"
+            f"review_gate_reasons: {segment_payload.get('review_gate_reasons', [])}\n"
             f"alignment_quality: {segment_payload.get('alignment_quality')}\n"
             f"candidate_agreement_score: {segment_payload.get('candidate_agreement_score')}\n"
+            f"selected_source_before_llm: {segment_payload.get('selected_source', '')}\n"
+            f"final_text_before_llm: {segment_payload.get('final_text_display', segment_payload.get('final_text', ''))}\n"
             f"apple_display_text: {segment_payload.get('apple_display_text', segment_payload.get('apple', {}).get('text', ''))}\n"
             f"apple_boundary_hints: {json.dumps(segment_payload.get('apple_boundary_hints', []), ensure_ascii=False)}\n"
             f"candidates: {json.dumps(candidate_summary, ensure_ascii=False)}\n"

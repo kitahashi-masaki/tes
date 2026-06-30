@@ -612,10 +612,17 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- review_sample_level_counts: {summary.get('review_sample_level_counts', {})}")
     lines.append(f"- qwen_alignment_low_by_selected_source: {summary.get('qwen_alignment_low_by_selected_source', {})}")
     lines.append(f"- qwen_alignment_low_human_required_by_selected_source: {summary.get('qwen_alignment_low_human_required_by_selected_source', {})}")
+    lines.append(f"- qwen_alignment_low_machine_note_by_selected_source: {summary.get('qwen_alignment_low_machine_note_by_selected_source', {})}")
     lines.append(f"- unusual_final_text_pattern_count: {summary.get('unusual_final_text_pattern_count', 0)}")
     lines.append(f"- unusual_final_text_pattern_human_required_count: {summary.get('unusual_final_text_pattern_human_required_count', 0)}")
     lines.append(f"- unusual_final_text_pattern_machine_note_count: {summary.get('unusual_final_text_pattern_machine_note_count', 0)}")
     lines.append(f"- unusual_final_text_patterns_by_level: {summary.get('unusual_final_text_patterns_by_level', {})}")
+    lines.append(f"- llm_target_max_blocks: {summary.get('llm_target_max_blocks', 10)}")
+    lines.append(f"- llm_candidate_block_count: {summary.get('llm_candidate_block_count', 0)}")
+    lines.append(f"- llm_target_block_count: {summary.get('llm_target_block_count', 0)}")
+    lines.append(f"- llm_skipped_human_required_count: {summary.get('llm_skipped_human_required_count', 0)}")
+    lines.append(f"- llm_target_selection_reasons: {summary.get('llm_target_selection_reasons', {})}")
+    lines.append(f"- llm_target_block_ids: {summary.get('llm_target_block_ids', [])}")
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
@@ -805,6 +812,40 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
     unusual_final_text_pattern_human_required_count = 0
     unusual_final_text_pattern_machine_note_count = 0
     review_sample_level_counts = Counter()
+    llm_candidate_block_count = 0
+    llm_target_block_count = 0
+    llm_skipped_human_required_count = 0
+    llm_target_selection_reasons = Counter()
+    llm_target_block_ids: list[str] = []
+    llm_target_max_blocks = 10
+    llm_resolved_human_review_count = 0
+    llm_kept_human_review_count = 0
+    llm_changed_final_text_count = 0
+    llm_no_change_count = 0
+    llm_candidate_out_of_set_violation_count = 0
+
+    def _target_reasons(block: dict[str, Any]) -> list[str]:
+        flags = set(str(flag) for flag in (block.get("final_risk_flags") or block.get("risk_flags") or []))
+        review_gate_reasons = set(str(reason) for reason in (block.get("review_gate_reasons") or []))
+        unusual_patterns = list(block.get("unusual_final_text_patterns") or [])
+        reasons: list[str] = []
+        if "numeric_disagreement" in flags:
+            reasons.append("numeric_disagreement")
+        if "critical_term_disagreement" in flags:
+            reasons.append("critical_term_disagreement")
+        if "domain_error_phrase" in flags:
+            reasons.append("domain_error_phrase")
+        if any(isinstance(item, dict) and item.get("severity") == "human_required" for item in unusual_patterns):
+            reasons.append("genuine_unusual_final_text_pattern")
+        if "boundary_contamination_suspected" in flags:
+            reasons.append("boundary_contamination_suspected")
+        selected_source = str(block.get("selected_source") or "")
+        selected_alignment = float(block.get("selected_source_alignment_score") or 0.0)
+        if selected_source and selected_source != "apple" and selected_alignment < 0.82:
+            reasons.append("selected_source_alignment_low")
+        if "numeric_disagreement" in review_gate_reasons and "numeric_disagreement" not in reasons:
+            reasons.append("numeric_disagreement")
+        return reasons
 
     for row in review_sample_rows:
         review_sample_level_counts[str(row.get("review_level") or "unknown")] += 1
@@ -830,6 +871,29 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
                 unusual_final_text_pattern_human_required_count += 1
             if block.get("machine_review_note"):
                 unusual_final_text_pattern_machine_note_count += 1
+        target_reasons = _target_reasons(block)
+        if block.get("human_review_required"):
+            if target_reasons:
+                llm_candidate_block_count += 1
+                if len(llm_target_block_ids) < llm_target_max_blocks:
+                    llm_target_block_ids.append(str(block.get("block_id") or ""))
+                    llm_target_block_count += 1
+                    for reason in target_reasons:
+                        llm_target_selection_reasons[reason] += 1
+                else:
+                    llm_skipped_human_required_count += 1
+            else:
+                llm_skipped_human_required_count += 1
+        if block.get("llm_selected"):
+            if block.get("llm_resolved") and not block.get("human_review_required"):
+                llm_resolved_human_review_count += 1
+            elif block.get("human_review_required"):
+                llm_kept_human_review_count += 1
+        if block.get("llm_selected"):
+            if str(block.get("final_text_before_cleanup") or "") == str(block.get("final_text") or ""):
+                llm_no_change_count += 1
+            else:
+                llm_changed_final_text_count += 1
 
     human_review_required_count = sum(1 for row in final_blocks if row.get("human_review_required"))
     review_queue_row_count = len(review_rows)
@@ -846,6 +910,17 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
         "qwen_alignment_low_by_selected_source": dict(qwen_alignment_low_by_selected_source),
         "qwen_alignment_low_human_required_by_selected_source": dict(qwen_alignment_low_human_required_by_selected_source),
         "qwen_alignment_low_machine_note_by_selected_source": dict(qwen_alignment_low_machine_note_by_selected_source),
+        "llm_target_max_blocks": llm_target_max_blocks,
+        "llm_candidate_block_count": llm_candidate_block_count,
+        "llm_target_block_count": llm_target_block_count,
+        "llm_skipped_human_required_count": llm_skipped_human_required_count,
+        "llm_target_selection_reasons": dict(llm_target_selection_reasons),
+        "llm_target_block_ids": llm_target_block_ids,
+        "llm_resolved_human_review_count": llm_resolved_human_review_count,
+        "llm_kept_human_review_count": llm_kept_human_review_count,
+        "llm_changed_final_text_count": llm_changed_final_text_count,
+        "llm_no_change_count": llm_no_change_count,
+        "llm_candidate_out_of_set_violation_count": llm_candidate_out_of_set_violation_count,
         "unusual_final_text_pattern_count": unusual_final_text_pattern_count,
         "unusual_final_text_pattern_human_required_count": unusual_final_text_pattern_human_required_count,
         "unusual_final_text_pattern_machine_note_count": unusual_final_text_pattern_machine_note_count,
@@ -1250,7 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-endpoint", default="http://127.0.0.1:8010/v1/chat/completions")
     parser.add_argument("--llm-model", default="assistant")
     parser.add_argument("--llm-api-key", default="local-qwen3-assistant")
-    parser.add_argument("--llm-max-segments", type=int, default=200)
+    parser.add_argument("--llm-max-segments", type=int, default=10)
     parser.add_argument("--llm-only-risky", action="store_true")
     parser.add_argument("--candidate-build-mode", choices=["full", "staged", "qwen-only"], default="staged")
     parser.add_argument("--workers", type=int, default=8)

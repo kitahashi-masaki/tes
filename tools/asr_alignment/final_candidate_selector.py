@@ -348,12 +348,8 @@ def _find_unusual_final_text_patterns(text: str) -> list[dict[str, str]]:
     seen: set[tuple[str, str]] = set()
     if not value.strip():
         return patterns
-    ordered_patterns = []
     for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED:
-        ordered_patterns.append((pattern, "human_required"))
-    for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE:
-        ordered_patterns.append((pattern, "machine_note"))
-    for pattern, severity in ordered_patterns:
+        severity = "human_required"
         start = value.find(pattern)
         if start < 0:
             continue
