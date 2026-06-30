@@ -444,6 +444,26 @@ def _build_block_payload(
         and qwen_layer.get("boundary_contamination") is False
         and qwen_layer.get("usable_for_agreement") is True
     )
+    qwen_high_confidence_reject_reasons: list[str] = []
+    if not qwen_high_confidence:
+        if qwen_layer.get("local_alignment_score", 0.0) < 0.90:
+            qwen_high_confidence_reject_reasons.append("qwen_alignment_lt_0_90")
+        if qwen_similarity < 0.88:
+            qwen_high_confidence_reject_reasons.append("qwen_apple_similarity_lt_0_88")
+        if qwen_diff_type not in {"none", "surface", "soft_domain"}:
+            qwen_high_confidence_reject_reasons.append("qwen_difference_not_safe")
+        if qwen_numeric_disagreement:
+            qwen_high_confidence_reject_reasons.append("qwen_numeric_disagreement")
+        if qwen_critical:
+            qwen_high_confidence_reject_reasons.append("qwen_critical_term_disagreement")
+        if qwen_domain_error:
+            qwen_high_confidence_reject_reasons.append("qwen_domain_error")
+        if preliminary_quality not in {"A", "B"}:
+            qwen_high_confidence_reject_reasons.append("preliminary_quality_not_a_or_b")
+        if qwen_layer.get("boundary_contamination") is not False:
+            qwen_high_confidence_reject_reasons.append("qwen_boundary_contamination")
+        if qwen_layer.get("usable_for_agreement") is not True:
+            qwen_high_confidence_reject_reasons.append("qwen_not_usable_for_agreement")
     skip_support = candidate_build_mode in {"staged", "qwen-only"} and qwen_high_confidence
     if candidate_build_mode == "qwen-only":
         skip_support = True
@@ -510,6 +530,7 @@ def _build_block_payload(
     payload["qwen_apple_difference_type"] = qwen_diff_type
     payload["qwen_apple_similarity"] = qwen_similarity
     payload["qwen_high_confidence"] = qwen_high_confidence
+    payload["qwen_high_confidence_reject_reasons"] = qwen_high_confidence_reject_reasons
     payload["qwen_domain_error"] = qwen_domain_error
     payload["important_term_disagreement"] = qwen_diff_type in {"critical", "semantic"}
     payload["critical_term_disagreement"] = qwen_critical
@@ -612,6 +633,7 @@ def build_block_candidates(
     engine_heavy_skipped = Counter()
     engine_early_exit_ids = defaultdict(list)
     skip_reason_counts = Counter()
+    qwen_high_confidence_reject_reason_counts = Counter()
     fallback_expanded = Counter()
     search_radius_sum = Counter()
     search_radius_max = Counter()
@@ -646,6 +668,7 @@ def build_block_candidates(
             quality_counts[alignment_quality] = quality_counts.get(alignment_quality, 0) + 1
             for stage_name, elapsed in (payload.get("block_build_sec_by_stage") or {}).items():
                 stage_secs[stage_name] += float(elapsed)
+            qwen_high_confidence_reject_reason_counts.update(payload.get("qwen_high_confidence_reject_reasons", []) or [])
             for engine in ("qwen", "nemotron", "whisper"):
                 cand = payload.get(engine, {})
                 if cand.get("skipped"):
@@ -673,6 +696,27 @@ def build_block_candidates(
                     flush=True,
                 )
     total_sec = time.time() - t0
+    slowest_blocks = sorted(
+        (
+            {
+                "block_id": row.get("block_id"),
+                "block_build_total_sec": round(float(row.get("block_build_total_sec", 0.0) or 0.0), 4),
+                "alignment_quality": row.get("alignment_quality"),
+                "needs_review": row.get("needs_review"),
+                "qwen_local_alignment_score": row.get("qwen", {}).get("local_alignment_score") if isinstance(row.get("qwen"), dict) else None,
+                "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
+                "risk_flags": row.get("risk_flags", []),
+                "stage_sec": {
+                    stage_name: round(float(elapsed), 4)
+                    for stage_name, elapsed in (row.get("block_build_sec_by_stage") or {}).items()
+                    if float(elapsed or 0.0) >= 0.01
+                },
+            }
+            for row in rows
+        ),
+        key=lambda item: item["block_build_total_sec"],
+        reverse=True,
+    )[:10]
 
     summary = {
         "episode_id": episode_id,
@@ -708,6 +752,7 @@ def build_block_candidates(
         "candidate_refinement_executed_count_by_engine": dict(engine_exec),
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_skipped_reason_counts": dict(skip_reason_counts),
+        "qwen_high_confidence_reject_reason_counts": dict(qwen_high_confidence_reject_reason_counts),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
         "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
         "candidate_refinement_early_exit_block_ids_by_engine": dict(engine_early_exit_ids),
@@ -719,6 +764,7 @@ def build_block_candidates(
         },
         "max_search_radius_by_engine": dict(search_radius_max),
         "candidate_build_mode": candidate_build_mode,
+        "candidate_build_slowest_blocks": slowest_blocks,
         "workers": max_workers,
         "boundary_hint_build_total_sec": build_stats["boundary_hint_build_total_sec"],
         "boundary_hint_build_count_by_source": dict(build_stats["boundary_hint_build_count_by_source"]),
