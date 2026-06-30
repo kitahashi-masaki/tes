@@ -593,6 +593,7 @@ def refine_local_asr_span(
             "refinement_candidate_pruned_count": 0,
             "refinement_window_span": 0,
             "refinement_target_len": apple_norm_len,
+            "refinement_estimated_full_grid_count": 0,
             "refinement_start_candidate_count": 0,
             "refinement_end_candidate_count": 0,
         }
@@ -619,6 +620,10 @@ def refine_local_asr_span(
     start_step = 4 if use_coarse_to_fine else 2
     end_step = 4 if use_coarse_to_fine else 2
     upper_start = min(window_right, max(0, asr_norm_len - 1))
+    estimated_start_count = max(0, ((upper_start - window_left) // max(start_step, 1)) + 1)
+    estimated_end_count = max(1, ((max_len - min_len) // max(end_step, 1)) + 1)
+    estimated_full_grid_count = estimated_start_count * estimated_end_count
+    use_bounded_search = use_coarse_to_fine
     start_candidate_count = 0
     end_candidate_count = 0
 
@@ -723,10 +728,10 @@ def refine_local_asr_span(
             ):
                 early_exit = True
 
-    start_values = _bounded_start_candidates() if use_coarse_to_fine else list(range(window_left, upper_start + 1, start_step))
+    start_values = _bounded_start_candidates() if use_bounded_search else list(range(window_left, upper_start + 1, start_step))
     start_candidate_count += len(start_values)
     for start in start_values:
-        if use_coarse_to_fine:
+        if use_bounded_search:
             end_values = _bounded_end_candidates(start)
         else:
             min_end = min(asr_norm_len, max(start + min_len, start + 1))
@@ -841,6 +846,7 @@ def refine_local_asr_span(
         "refinement_candidate_pruned_count": candidate_pruned_count,
         "refinement_window_span": window_span,
         "refinement_target_len": target_len,
+        "refinement_estimated_full_grid_count": estimated_full_grid_count,
         "refinement_start_candidate_count": start_candidate_count,
         "refinement_end_candidate_count": end_candidate_count,
     }

@@ -315,6 +315,7 @@ def _extract_candidate(
         "refinement_candidate_pruned_count": int(refined.get("refinement_candidate_pruned_count", 0) or 0),
         "refinement_window_span": int(refined.get("refinement_window_span", 0) or 0),
         "refinement_target_len": int(refined.get("refinement_target_len", 0) or 0),
+        "refinement_estimated_full_grid_count": int(refined.get("refinement_estimated_full_grid_count", 0) or 0),
         "refinement_start_candidate_count": int(refined.get("refinement_start_candidate_count", 0) or 0),
         "refinement_end_candidate_count": int(refined.get("refinement_end_candidate_count", 0) or 0),
         "boundary_hint_used_for_boundary_eval": False,
@@ -356,6 +357,7 @@ def _build_placeholder_candidate(*, source: str, reason: str, boundary_hints_ava
         "refinement_candidate_pruned_count": 0,
         "refinement_window_span": 0,
         "refinement_target_len": 0,
+        "refinement_estimated_full_grid_count": 0,
         "refinement_start_candidate_count": 0,
         "refinement_end_candidate_count": 0,
         "boundary_hint_used_for_boundary_eval": False,
@@ -674,6 +676,8 @@ def build_block_candidates(
     start_candidate_max = Counter()
     end_candidate_sum = Counter()
     end_candidate_max = Counter()
+    estimated_grid_sum = Counter()
+    estimated_grid_max = Counter()
     qwen_high_confidence_reject_reason_counts = Counter()
     fallback_expanded = Counter()
     search_radius_sum = Counter()
@@ -744,6 +748,9 @@ def build_block_candidates(
                     end_count = int(cand.get("refinement_end_candidate_count", 0) or 0)
                     end_candidate_sum[engine] += end_count
                     end_candidate_max[engine] = max(end_candidate_max[engine], end_count)
+                    estimated_grid_count = int(cand.get("refinement_estimated_full_grid_count", 0) or 0)
+                    estimated_grid_sum[engine] += estimated_grid_count
+                    estimated_grid_max[engine] = max(estimated_grid_max[engine], estimated_grid_count)
             completed += 1
             if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
                 print(
@@ -801,6 +808,11 @@ def build_block_candidates(
                 },
                 "refinement_end_candidate_counts": {
                     engine: row.get(engine, {}).get("refinement_end_candidate_count")
+                    for engine in ("qwen", "nemotron", "whisper")
+                    if isinstance(row.get(engine), dict)
+                },
+                "refinement_estimated_full_grid_counts": {
+                    engine: row.get(engine, {}).get("refinement_estimated_full_grid_count")
                     for engine in ("qwen", "nemotron", "whisper")
                     if isinstance(row.get(engine), dict)
                 },
@@ -873,6 +885,8 @@ def build_block_candidates(
         "refinement_start_candidate_max_by_engine": dict(start_candidate_max),
         "refinement_end_candidate_sum_by_engine": dict(end_candidate_sum),
         "refinement_end_candidate_max_by_engine": dict(end_candidate_max),
+        "refinement_estimated_full_grid_sum_by_engine": dict(estimated_grid_sum),
+        "refinement_estimated_full_grid_max_by_engine": dict(estimated_grid_max),
         "qwen_high_confidence_reject_reason_counts": dict(qwen_high_confidence_reject_reason_counts),
         "qwen_high_confidence_primary_reject_reason_counts": dict(qwen_high_confidence_primary_reject_reason_counts),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
