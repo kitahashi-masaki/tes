@@ -885,12 +885,13 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
             else:
                 llm_skipped_human_required_count += 1
         if block.get("llm_selected"):
-            if block.get("llm_resolved") and not block.get("human_review_required"):
+            if block.get("llm_resolved"):
                 llm_resolved_human_review_count += 1
             elif block.get("human_review_required"):
                 llm_kept_human_review_count += 1
-        if block.get("llm_selected"):
-            if str(block.get("final_text_before_cleanup") or "") == str(block.get("final_text") or ""):
+            if block.get("llm_changed_final_text"):
+                llm_changed_final_text_count += 1
+            elif str(block.get("final_text_before_cleanup") or "") == str(block.get("final_text") or ""):
                 llm_no_change_count += 1
             else:
                 llm_changed_final_text_count += 1
@@ -1062,6 +1063,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             missing_output_files.append("review_queue_count_mismatch")
         summary["review_sample_path"] = str(output_dir / "reports" / f"{episode_id}.review_sample_blocks.json")
         summary["review_sample_count"] = len(review_sample_rows)
+        summary["llm_called_block_count"] = sum(1 for row in final_blocks if row.get("llm_called"))
+        summary["llm_selected_count"] = sum(1 for row in final_blocks if row.get("llm_selected"))
+        summary["llm_resolved_count"] = sum(1 for row in final_blocks if row.get("llm_resolved"))
+        summary["llm_changed_final_text_count"] = sum(1 for row in final_blocks if row.get("llm_changed_final_text"))
+        summary["llm_no_change_count"] = sum(1 for row in final_blocks if row.get("llm_selected") and not row.get("llm_changed_final_text"))
         (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
         if missing_output_files:
@@ -1225,6 +1231,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summary["review_queue_matches_human_review_required"] = summary["human_review_required_count"] == summary["review_queue_row_count"]
     summary["review_queue_matches_final_blocks"] = summary["review_queue_matches_human_review_required"]
     summary["sentence_timeline_row_count"] = len(final_rows)
+    summary["llm_called_block_count"] = sum(1 for row in final_blocks if row.get("llm_called"))
+    summary["llm_selected_count"] = sum(1 for row in final_blocks if row.get("llm_selected"))
+    summary["llm_resolved_count"] = sum(1 for row in final_blocks if row.get("llm_resolved"))
+    summary["llm_changed_final_text_count"] = sum(1 for row in final_blocks if row.get("llm_changed_final_text"))
+    summary["llm_no_change_count"] = sum(1 for row in final_blocks if row.get("llm_selected") and not row.get("llm_changed_final_text"))
     summary["sentence_timeline_display_text_block_leak_count"] = sum(
         1
         for row in final_rows
@@ -1258,6 +1269,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["review_sample_path"] = str(review_sample_path)
     summary["review_sample_count"] = len(review_sample_rows)
+    summary["llm_called_block_count"] = sum(1 for row in final_blocks if row.get("llm_called"))
+    summary["llm_selected_count"] = sum(1 for row in final_blocks if row.get("llm_selected"))
+    summary["llm_resolved_count"] = sum(1 for row in final_blocks if row.get("llm_resolved"))
+    summary["llm_changed_final_text_count"] = sum(1 for row in final_blocks if row.get("llm_changed_final_text"))
+    summary["llm_no_change_count"] = sum(1 for row in final_blocks if row.get("llm_selected") and not row.get("llm_changed_final_text"))
     (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
     (output_dir / "normalized" / f"{episode_id}.manifest.json").write_text(

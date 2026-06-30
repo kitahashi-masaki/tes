@@ -870,6 +870,7 @@ def select_final_candidates(
         normalized_needs_review = bool(segment.get("needs_review"))
         llm_selected = False
         llm_resolved = False
+        llm_changed_final_text = False
         review_reason = list(segment.get("risk_flags") or [])
         llm_decision: LLMDecision | None = None
         should_call = False
@@ -912,6 +913,7 @@ def select_final_candidates(
                     llm_text = str(llm_decision.final_text).strip()
                     if llm_text and segment_similarity_score(llm_text, final_text) < 0.95:
                         stats["llm_changed_final_text_count"] += 1
+                        llm_changed_final_text = True
                     if llm_text:
                         final_text_raw = llm_text
                         final_text = llm_text
@@ -1105,6 +1107,7 @@ def select_final_candidates(
             "human_review_reason": human_review_reason,
             "llm_selected": llm_selected,
             "llm_resolved": llm_resolved,
+            "llm_changed_final_text": llm_changed_final_text,
             "review_reason": review_reason,
             "risk_flags": final_risk_flags,
             "final_risk_flags": final_risk_flags,
@@ -1180,6 +1183,7 @@ def select_final_candidates(
                     "human_review_reason": human_review_reason,
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
+                    "llm_changed_final_text": llm_changed_final_text,
                     "review_reason": review_reason,
                     "risk_flags": final_risk_flags,
                     "suggested_final_text": suggested_final_text,
@@ -1248,6 +1252,7 @@ def select_final_candidates(
                     "llm_called": bool(should_call),
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
+                    "llm_changed_final_text": llm_changed_final_text,
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                     "apple_display_text": candidate_summary.get("apple", ""),
                     "apple_text": candidate_summary.get("apple", ""),
@@ -1281,6 +1286,7 @@ def select_final_candidates(
                     "llm_called": bool(should_call),
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
+                    "llm_changed_final_text": llm_changed_final_text,
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
