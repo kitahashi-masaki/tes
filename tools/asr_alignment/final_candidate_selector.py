@@ -339,6 +339,38 @@ _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE = (
     "のだから",
     "野郎",
 )
+_UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW = 28
+
+
+def _find_unusual_final_text_patterns(text: str) -> list[dict[str, str]]:
+    value = str(text or "")
+    patterns: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    if not value.strip():
+        return patterns
+    ordered_patterns = []
+    for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED:
+        ordered_patterns.append((pattern, "human_required"))
+    for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE:
+        ordered_patterns.append((pattern, "machine_note"))
+    for pattern, severity in ordered_patterns:
+        start = value.find(pattern)
+        if start < 0:
+            continue
+        end = start + len(pattern)
+        key = (pattern, severity)
+        if key in seen:
+            continue
+        seen.add(key)
+        patterns.append(
+            {
+                "pattern_id": pattern,
+                "matched_text": pattern,
+                "context": value[max(0, start - _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW) : min(len(value), end + _UNUSUAL_FINAL_TEXT_PATTERN_CONTEXT_WINDOW)],
+                "severity": severity,
+            }
+        )
+    return patterns
 
 
 def _unusual_final_text_pattern_level(text: str) -> str | None:
@@ -387,7 +419,7 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
     whisper_text = _normalized_review_text(block.get("whisper_text"), final_text_display)
     candidate_texts = _candidate_texts_for_block(block)
     final_risk_flags = list(block.get("final_risk_flags") or block.get("risk_flags") or [])
-    unusual_patterns = [flag for flag in final_risk_flags if flag == "unusual_final_text_pattern"]
+    unusual_patterns = _find_unusual_final_text_patterns(final_text_display)
     row = {
         "episode_id": block.get("episode_id", ""),
         "block_id": block.get("block_id", ""),
@@ -409,8 +441,8 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "selected_source": _normalized_review_text(block.get("selected_source")),
         "selection_method": _normalized_review_text(block.get("selection_method")),
         "alignment_quality": _normalized_review_text(block.get("alignment_quality")),
-        "qwen_apple_difference_type": _normalized_review_text(block.get("qwen_apple_difference_type")),
-        "qwen_apple_similarity": block.get("qwen_apple_similarity", 0.0),
+        "qwen_apple_difference_type": _normalized_review_text(block.get("qwen_apple_difference_type"), "unknown"),
+        "qwen_apple_similarity": float(block.get("qwen_apple_similarity") if block.get("qwen_apple_similarity") is not None else 0.0),
         "final_text_raw": final_text,
         "final_text_display": final_text_display,
         "apple_text": apple_text,
@@ -471,22 +503,9 @@ def _classify_review_level(
         note_reasons.append("qwen_apple_disagreement")
 
     if qwen_alignment < 0.82:
-        selected_candidate = segment.get(selected_source, {}) if isinstance(segment.get(selected_source), dict) else {}
-        selected_local_alignment = float(selected_candidate.get("local_alignment_score", selected_candidate.get("alignment_score", 0.0)) or 0.0)
-        selected_source_has_local_issue = bool(
-            selected_source == "qwen"
-            or selected_local_alignment < 0.82
-            or selected_candidate.get("boundary_contamination")
-            or selected_candidate.get("span_too_long")
-            or selected_candidate.get("span_too_short")
-        )
         if selected_source == "qwen":
             gate_reasons.append("qwen_alignment_low")
-        elif any(flag in reasons for flag in {"numeric_disagreement", "critical_term_disagreement", "domain_error_phrase"}):
-            gate_reasons.append("qwen_alignment_low")
-        elif _unusual_final_text_pattern_level(final_text) == "human_required":
-            gate_reasons.append("qwen_alignment_low")
-        elif selected_source_has_local_issue:
+        elif any(flag in reasons for flag in severe_gate_flags | {"boundary_contamination_suspected"}):
             gate_reasons.append("qwen_alignment_low")
         else:
             note_reasons.append("qwen_alignment_low")
@@ -530,7 +549,13 @@ def _classify_review_level(
     }
 
 
-def _human_review_required(segment: dict[str, Any], final_risk_flags: list[str], final_text: str) -> tuple[bool, list[str]]:
+def _human_review_required(
+    segment: dict[str, Any],
+    final_risk_flags: list[str],
+    final_text: str,
+    *,
+    selected_source: str = "",
+) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     diff_type = str(segment.get("qwen_apple_difference_type") or "semantic")
     qwen = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
@@ -548,7 +573,7 @@ def _human_review_required(segment: dict[str, Any], final_risk_flags: list[str],
         reasons.append("qwen_apple_disagreement")
     if diff_type in {"critical", "semantic"} and "qwen_apple_disagreement" not in final_risk_flags:
         reasons.append("qwen_apple_disagreement")
-    if qwen_alignment < 0.82:
+    if qwen_alignment < 0.82 and (selected_source == "qwen" or any(flag in final_risk_flags for flag in severe_flags)):
         reasons.append("qwen_alignment_low")
     if _has_unusual_final_text_pattern(final_text):
         reasons.append("unusual_final_text_pattern")
@@ -893,7 +918,8 @@ def select_final_candidates(
             candidate_text_similarity = max(segment_similarity_score(final_text, candidate_text) for candidate_text in candidate_texts_for_mix)
         if llm_selected and llm_decision is not None and llm_decision.final_text and candidate_text_similarity < 0.92:
             final_risk_flags.append("llm_candidate_mix_suspected")
-        if _has_unusual_final_text_pattern(final_text) and "unusual_final_text_pattern" not in final_risk_flags:
+        unusual_final_text_patterns = _find_unusual_final_text_patterns(final_text)
+        if unusual_final_text_patterns and "unusual_final_text_pattern" not in final_risk_flags:
             final_risk_flags.append("unusual_final_text_pattern")
 
         display_source_text = final_text if domain_text_corrected else _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
@@ -990,7 +1016,7 @@ def select_final_candidates(
             "time": segment_time,
             "alignment_quality": segment.get("alignment_quality"),
             "qwen_apple_difference_type": segment.get("qwen_apple_difference_type"),
-            "qwen_apple_similarity": segment.get("qwen_apple_similarity", 0.0),
+            "qwen_apple_similarity": float(segment.get("qwen_apple_similarity", 0.0) or 0.0),
             "final_text": final_text,
             "final_text_raw": final_text_before_cleanup,
             "final_text_after_boundary_cleanup": final_text,
@@ -1052,7 +1078,7 @@ def select_final_candidates(
             "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
             "selection_notes": llm_decision.notes if llm_decision is not None else "",
             "llm_error": llm_decision.error if llm_decision is not None else "",
-            "unusual_final_text_patterns": [flag for flag in final_risk_flags if flag == "unusual_final_text_pattern"],
+            "unusual_final_text_patterns": unusual_final_text_patterns,
         }
         final_blocks.append(block_final)
         for sentence_id in segment["sentence_ids"]:
@@ -1183,7 +1209,7 @@ def select_final_candidates(
                     "review_priority": review_priority,
                     "review_gate_reasons": review_gate_reasons,
                     "machine_note_reasons": machine_note_reasons,
-                    "unusual_final_text_patterns": [final_text] if _has_unusual_final_text_pattern(final_text) else [],
+                    "unusual_final_text_patterns": _find_unusual_final_text_patterns(final_text),
                     "llm_called": bool(should_call),
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
@@ -1221,7 +1247,7 @@ def select_final_candidates(
                     "nemotron_text": candidate_summary.get("nemotron", ""),
                     "whisper_text": candidate_summary.get("whisper", ""),
                     "candidate_texts": candidate_summary,
-                    "unusual_final_text_patterns": [final_text] if _has_unusual_final_text_pattern(final_text) else [],
+                    "unusual_final_text_patterns": _find_unusual_final_text_patterns(final_text),
                     "llm_called": bool(should_call),
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,

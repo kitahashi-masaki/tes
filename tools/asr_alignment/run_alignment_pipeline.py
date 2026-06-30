@@ -609,6 +609,13 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- review_queue 単位: {summary['review_queue_unit']}")
     lines.append(f"- review_queue と human_review_required の一致: {summary.get('review_queue_matches_human_review_required')}")
     lines.append(f"- review_level_counts: {summary.get('review_level_counts', {})}")
+    lines.append(f"- review_sample_level_counts: {summary.get('review_sample_level_counts', {})}")
+    lines.append(f"- qwen_alignment_low_by_selected_source: {summary.get('qwen_alignment_low_by_selected_source', {})}")
+    lines.append(f"- qwen_alignment_low_human_required_by_selected_source: {summary.get('qwen_alignment_low_human_required_by_selected_source', {})}")
+    lines.append(f"- unusual_final_text_pattern_count: {summary.get('unusual_final_text_pattern_count', 0)}")
+    lines.append(f"- unusual_final_text_pattern_human_required_count: {summary.get('unusual_final_text_pattern_human_required_count', 0)}")
+    lines.append(f"- unusual_final_text_pattern_machine_note_count: {summary.get('unusual_final_text_pattern_machine_note_count', 0)}")
+    lines.append(f"- unusual_final_text_patterns_by_level: {summary.get('unusual_final_text_patterns_by_level', {})}")
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
@@ -725,53 +732,128 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
-    review_rows = [row for row in block_rows if row.get("human_review_required")]
+def _sanitize_review_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return {str(key): _sanitize_review_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_review_value(item) for item in value]
+    return value
+
+
+def _review_candidate_texts(block: dict[str, Any]) -> dict[str, str]:
+    final_text = str(block.get("final_text_display") or block.get("final_text") or block.get("final_text_raw") or "(missing)")
+    candidate_texts = block.get("candidate_texts")
+    if not isinstance(candidate_texts, dict):
+        candidate_texts = {}
+    return {
+        "apple": str(block.get("apple_text") or candidate_texts.get("apple") or final_text),
+        "qwen": str(block.get("qwen_text") or candidate_texts.get("qwen") or final_text),
+        "nemotron": str(block.get("nemotron_text") or candidate_texts.get("nemotron") or final_text),
+        "whisper": str(block.get("whisper_text") or candidate_texts.get("whisper") or final_text),
+    }
+
+
+def _build_review_sample_rows(final_blocks: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
+    review_rows = [row for row in final_blocks if row.get("human_review_required")]
     sample_rows: list[dict[str, Any]] = []
     for row in review_rows[:limit]:
-        candidate_texts = row.get("candidate_texts")
-        if not isinstance(candidate_texts, dict):
-            candidate_texts = {
-                engine: row.get(f"{engine}_text", "")
-                for engine in ("apple", "qwen", "nemotron", "whisper")
-            }
-        unusual_patterns = row.get("unusual_final_text_patterns")
-        if not isinstance(unusual_patterns, list):
-            unusual_patterns = [row.get("final_text", "")] if row.get("review_level") == "human_required" and row.get("review_gate_reasons") else []
-        sample_rows.append(
-            {
-                "episode_id": row.get("episode_id"),
-                "block_id": row.get("block_id"),
-                "segment_id": row.get("segment_id"),
-                "alignment_quality": row.get("alignment_quality"),
-                "needs_review": row.get("needs_review"),
-                "pre_llm_needs_review": row.get("pre_llm_needs_review"),
-                "normalized_needs_review": row.get("normalized_needs_review"),
-                "human_review_required": row.get("human_review_required"),
-                "machine_review_note": row.get("machine_review_note"),
-                "review_level": row.get("review_level"),
-                "review_priority": row.get("review_priority"),
-                "review_gate_reasons": row.get("review_gate_reasons", []),
-                "machine_note_reasons": row.get("machine_note_reasons", []),
-                "needs_review_reason": row.get("needs_review_reason", []),
-                "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
-                "qwen_apple_similarity": row.get("qwen_apple_similarity"),
-                "risk_flags": row.get("risk_flags", []),
-                "final_risk_flags": row.get("final_risk_flags", row.get("risk_flags", [])),
-                "selected_source": row.get("selected_source"),
-                "selection_method": row.get("selection_method"),
-                "final_text_raw": row.get("final_text_raw", row.get("final_text", "")),
-                "final_text_display": row.get("final_text_display", row.get("final_text", "")),
-                "final_text": row.get("final_text", ""),
-                "apple_text": row.get("apple_text", row.get("apple", {}).get("text", "")),
-                "qwen_text": row.get("qwen_text", row.get("qwen", {}).get("text", "")),
-                "nemotron_text": row.get("nemotron_text", row.get("nemotron", {}).get("text", "")),
-                "whisper_text": row.get("whisper_text", row.get("whisper", {}).get("text", "")),
-                "candidate_texts": candidate_texts,
-                "unusual_final_text_patterns": unusual_patterns,
-            }
-        )
+        sample_row = {
+            "episode_id": row.get("episode_id", ""),
+            "block_id": row.get("block_id", ""),
+            "sentence_ids": list(row.get("sentence_ids") or []),
+            "time": _sanitize_review_value(row.get("time") or {}),
+            "alignment_quality": row.get("alignment_quality", ""),
+            "needs_review": bool(row.get("needs_review")),
+            "pre_llm_needs_review": bool(row.get("pre_llm_needs_review")),
+            "normalized_needs_review": bool(row.get("normalized_needs_review")),
+            "human_review_required": bool(row.get("human_review_required")),
+            "machine_review_note": bool(row.get("machine_review_note")),
+            "review_level": row.get("review_level", ""),
+            "review_priority": row.get("review_priority", ""),
+            "review_gate_reasons": list(row.get("review_gate_reasons") or []),
+            "machine_note_reasons": list(row.get("machine_note_reasons") or []),
+            "qwen_apple_difference_type": row.get("qwen_apple_difference_type", ""),
+            "qwen_apple_similarity": float(row.get("qwen_apple_similarity") if row.get("qwen_apple_similarity") is not None else 0.0),
+            "risk_flags": list(row.get("risk_flags") or []),
+            "final_risk_flags": list(row.get("final_risk_flags") or row.get("risk_flags") or []),
+            "selected_source": row.get("selected_source", ""),
+            "selection_method": row.get("selection_method", ""),
+            "llm_called": bool(row.get("llm_called")),
+            "llm_selected": bool(row.get("llm_selected")),
+            "llm_resolved": bool(row.get("llm_resolved")),
+            "final_text_raw": row.get("final_text_raw") or row.get("final_text", "") or "",
+            "final_text_display": row.get("final_text_display") or row.get("final_text", "") or "",
+            "apple_text": row.get("apple_text") or row.get("final_text_display") or row.get("final_text", "") or "(missing)",
+            "qwen_text": row.get("qwen_text") or row.get("final_text_display") or row.get("final_text", "") or "(missing)",
+            "nemotron_text": row.get("nemotron_text") or row.get("final_text_display") or row.get("final_text", "") or "(missing)",
+            "whisper_text": row.get("whisper_text") or row.get("final_text_display") or row.get("final_text", "") or "(missing)",
+            "candidate_texts": _review_candidate_texts(row),
+            "unusual_final_text_patterns": list(row.get("unusual_final_text_patterns") or []),
+        }
+        sample_rows.append(_sanitize_review_value(sample_row))
     return sample_rows
+
+
+def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: list[dict[str, Any]], review_sample_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    qwen_alignment_low_by_selected_source = Counter()
+    qwen_alignment_low_human_required_by_selected_source = Counter()
+    qwen_alignment_low_machine_note_by_selected_source = Counter({"apple": 0, "qwen": 0, "nemotron": 0, "whisper": 0})
+    unusual_final_text_patterns_by_level = {"human_required": Counter(), "machine_note": Counter()}
+    unusual_final_text_pattern_count = 0
+    unusual_final_text_pattern_human_required_count = 0
+    unusual_final_text_pattern_machine_note_count = 0
+    review_sample_level_counts = Counter()
+
+    for row in review_sample_rows:
+        review_sample_level_counts[str(row.get("review_level") or "unknown")] += 1
+
+    for block in final_blocks:
+        selected_source = str(block.get("selected_source") or "unknown")
+        if "qwen_alignment_low" in (block.get("review_gate_reasons") or []) or "qwen_alignment_low" in (block.get("machine_note_reasons") or []):
+            qwen_alignment_low_by_selected_source[selected_source] += 1
+            if block.get("human_review_required"):
+                qwen_alignment_low_human_required_by_selected_source[selected_source] += 1
+            if block.get("machine_review_note"):
+                qwen_alignment_low_machine_note_by_selected_source[selected_source] += 1
+        unusual_patterns = list(block.get("unusual_final_text_patterns") or [])
+        if unusual_patterns:
+            unusual_final_text_pattern_count += 1
+            review_level = str(block.get("review_level") or "unknown")
+            if review_level not in unusual_final_text_patterns_by_level:
+                unusual_final_text_patterns_by_level[review_level] = Counter()
+            for pattern in unusual_patterns:
+                pattern_id = str(pattern.get("pattern_id") or pattern.get("matched_text") or "unknown")
+                unusual_final_text_patterns_by_level[review_level][pattern_id] += 1
+            if block.get("human_review_required"):
+                unusual_final_text_pattern_human_required_count += 1
+            if block.get("machine_review_note"):
+                unusual_final_text_pattern_machine_note_count += 1
+
+    human_review_required_count = sum(1 for row in final_blocks if row.get("human_review_required"))
+    review_queue_row_count = len(review_rows)
+    return {
+        "review_queue_row_count": review_queue_row_count,
+        "machine_review_notes_row_count": sum(1 for row in final_blocks if row.get("review_level") == "machine_note"),
+        "needs_review_count_for_review_queue": review_queue_row_count,
+        "review_queue_unit": "block",
+        "needs_review_count": human_review_required_count,
+        "review_queue_matches_human_review_required": human_review_required_count == review_queue_row_count,
+        "review_queue_matches_final_blocks": human_review_required_count == review_queue_row_count,
+        "review_sample_count": len(review_sample_rows),
+        "review_sample_level_counts": dict(review_sample_level_counts),
+        "qwen_alignment_low_by_selected_source": dict(qwen_alignment_low_by_selected_source),
+        "qwen_alignment_low_human_required_by_selected_source": dict(qwen_alignment_low_human_required_by_selected_source),
+        "qwen_alignment_low_machine_note_by_selected_source": dict(qwen_alignment_low_machine_note_by_selected_source),
+        "unusual_final_text_pattern_count": unusual_final_text_pattern_count,
+        "unusual_final_text_pattern_human_required_count": unusual_final_text_pattern_human_required_count,
+        "unusual_final_text_pattern_machine_note_count": unusual_final_text_pattern_machine_note_count,
+        "unusual_final_text_patterns_by_level": {
+            "human_required": dict(unusual_final_text_patterns_by_level["human_required"]),
+            "machine_note": dict(unusual_final_text_patterns_by_level["machine_note"]),
+        },
+    }
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
@@ -827,6 +909,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             output_dir=output_dir,
         )
         summary["normalized_summary"] = read_json_from_path(output_dir / "reports" / f"{episode_id}.normalized_summary.json") if (output_dir / "reports" / f"{episode_id}.normalized_summary.json").exists() else {}
+        review_sample_rows = _build_review_sample_rows(final_blocks)
+        summary.update(_review_summary_metrics(final_blocks, review_rows, review_sample_rows))
+        review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
+        review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        summary["review_sample_path"] = str(review_sample_path)
+        summary["review_sample_count"] = len(review_sample_rows)
         summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
         summary["needs_review_count_normalized_blocks"] = sum(1 for row in block_rows if row.get("needs_review"))
         summary["human_review_required_count"] = sum(1 for row in final_blocks if row.get("human_review_required"))
@@ -898,7 +986,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         if not summary["review_queue_matches_human_review_required"]:
             missing_output_files.append("review_queue_count_mismatch")
         summary["review_sample_path"] = str(output_dir / "reports" / f"{episode_id}.review_sample_blocks.json")
-        summary["review_sample_count"] = len(review_rows)
+        summary["review_sample_count"] = len(review_sample_rows)
         (output_dir / "reports" / f"{episode_id}.summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         (output_dir / "reports" / f"{episode_id}.summary.md").write_text(_render_summary_markdown(summary), encoding="utf-8")
         if missing_output_files:
@@ -1090,6 +1178,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         ("排水の陣", "各家族", "社会行動", "整形立てて"),
     )
     review_sample_rows = _build_review_sample_rows(final_blocks)
+    summary.update(_review_summary_metrics(final_blocks, review_rows, review_sample_rows))
     review_sample_path = output_dir / "reports" / f"{episode_id}.review_sample_blocks.json"
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["review_sample_path"] = str(review_sample_path)
