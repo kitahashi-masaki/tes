@@ -24,6 +24,7 @@ if __package__ is None or __package__ == "":
         classify_qwen_apple_difference,
         raw_span_to_norm_span,
         _normalize_span_text,
+        _match_span_similarity,
         _span_similarity,
         refine_local_asr_span,
         save_jsonl,
@@ -42,6 +43,7 @@ else:
         classify_qwen_apple_difference,
         raw_span_to_norm_span,
         _normalize_span_text,
+        _match_span_similarity,
         _span_similarity,
         refine_local_asr_span,
         save_jsonl,
@@ -133,7 +135,7 @@ def _cheap_local_span(
             if end <= start or end > window_right:
                 continue
             candidate = asr_norm_text[start:end]
-            text_sim = _span_similarity(apple_target, candidate)
+            text_sim = _match_span_similarity(apple_target, candidate)
             len_score = 1.0 - min(1.0, abs(len(candidate) - target_len) / max(target_len, len(candidate), 1))
             score = max(0.0, min(1.0, 0.82 * text_sim + 0.18 * len_score))
             drift = abs(start - projected_start) + abs(end - projected_end)

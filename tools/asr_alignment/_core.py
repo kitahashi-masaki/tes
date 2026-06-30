@@ -429,6 +429,10 @@ def _span_similarity(left: str, right: str) -> float:
     return sequence_similarity(_normalize_span_text(left), _normalize_span_text(right))
 
 
+def _match_span_similarity(left_match_norm: str, right_match_norm: str) -> float:
+    return sequence_similarity(left_match_norm, right_match_norm)
+
+
 def _extract_anchor_terms(texts: list[str]) -> set[str]:
     normalized_texts = [_normalize_span_text(text) for text in texts if text]
     hits: set[str] = set()
@@ -602,7 +606,7 @@ def refine_local_asr_span(
         if not candidate.strip():
             return
         candidate_eval_count += 1
-        text_sim = _span_similarity(apple_target, candidate)
+        text_sim = _match_span_similarity(apple_target, candidate)
         len_score = 1.0 - min(1.0, abs(len(candidate) - target_len) / max(target_len, len(candidate), 1))
         boundary_score = 1.0
         if start <= window_left or end >= window_right:
