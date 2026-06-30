@@ -551,9 +551,10 @@ def refine_local_asr_span(
             max(initial_char_start + max(len(apple_artifact.raw_text[apple_raw_start:apple_raw_end]), 1), initial_char_start + 1),
         )
     initial_text = asr_artifact.raw_text[initial_char_start:initial_char_end]
-    initial_local_alignment_score = max(0.0, min(1.0, _span_similarity(apple_target, initial_text)))
-    initial_norm_len = len(_normalize_span_text(initial_text))
-    apple_norm_len = max(len(_normalize_span_text(apple_target)), 1)
+    initial_norm_text = _normalize_span_text(initial_text)
+    initial_local_alignment_score = max(0.0, min(1.0, _match_span_similarity(apple_target, initial_norm_text)))
+    initial_norm_len = len(initial_norm_text)
+    apple_norm_len = max(len(apple_target), 1)
     span_length_ratio = initial_norm_len / apple_norm_len
     initial_boundary_contamination = (
         not initial_text.strip()
@@ -579,8 +580,8 @@ def refine_local_asr_span(
             "span_too_long": False,
             "span_boundary_adjusted": False,
             "span_boundary_adjust_reason": [],
-            "usable_for_agreement": len(_normalize_span_text(initial_text)) > 2,
-            "unusable_reason": "" if len(_normalize_span_text(initial_text)) > 2 else "too_short",
+            "usable_for_agreement": len(initial_norm_text) > 2,
+            "unusable_reason": "" if len(initial_norm_text) > 2 else "too_short",
             "initial_text": initial_text,
             "refined_text": initial_text,
             "early_exit": True,
@@ -790,8 +791,10 @@ def refine_local_asr_span(
         or refined_text[:1].isspace()
         or refined_text[-1:].isspace()
     )
-    span_too_short = len(_normalize_span_text(refined_text)) < max(3, len(_normalize_span_text(apple_target)) // 4)
-    span_too_long = len(_normalize_span_text(refined_text)) > max(12, int(len(_normalize_span_text(apple_target)) * 2.5))
+    refined_norm_text = _normalize_span_text(refined_text)
+    apple_target_len = len(apple_target)
+    span_too_short = len(refined_norm_text) < max(3, apple_target_len // 4)
+    span_too_long = len(refined_norm_text) > max(12, int(apple_target_len * 2.5))
     adjusted_reasons: list[str] = []
     if refined_text and refined_text[:1] in {"ん", "に", "ち"}:
         refined_char_start = max(0, refined_char_start - 2)
@@ -802,8 +805,9 @@ def refine_local_asr_span(
     if adjusted_reasons:
         refined_text = asr_artifact.raw_text[refined_char_start:refined_char_end]
         refined_norm_start, refined_norm_end = asr_artifact.norm_span_from_raw_range(refined_char_start, refined_char_end)
+        refined_norm_text = _normalize_span_text(refined_text)
         span_refined = True
-    local_alignment_score = max(0.0, min(1.0, best["score"] if best["score"] >= 0 else _span_similarity(apple_target, refined_text)))
+    local_alignment_score = max(0.0, min(1.0, best["score"] if best["score"] >= 0 else _match_span_similarity(apple_target, refined_norm_text)))
     unusable_reason = ""
     if not refined_text.strip():
         unusable_reason = "empty_candidate"
@@ -815,7 +819,7 @@ def refine_local_asr_span(
         unusable_reason = "span_too_short"
     elif span_too_long:
         unusable_reason = "span_too_long"
-    usable_for_agreement = not unusable_reason and len(_normalize_span_text(refined_text)) > 2
+    usable_for_agreement = not unusable_reason and len(refined_norm_text) > 2
     if not usable_for_agreement and not unusable_reason:
         unusable_reason = "too_short"
     return {

@@ -124,7 +124,7 @@ def _cheap_local_span(
     asr_len = len(asr_norm_text)
     if asr_len <= 0:
         return {"start": projected_start, "end": projected_end, "score": 0.0}
-    target_len = max(len(_normalize_span_text(apple_target)), 1)
+    target_len = max(len(apple_target), 1)
     window_left = max(0, projected_start - radius)
     window_right = min(asr_len, projected_end + radius)
     min_len = max(1, int(target_len * 0.75))
