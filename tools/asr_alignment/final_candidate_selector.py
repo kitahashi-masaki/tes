@@ -265,6 +265,50 @@ def _domain_preferred_source(
     return source, text, ["domain_error_avoided_by_candidate_switch"]
 
 
+def _qwen_trailing_cut_text(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    if _TRAILING_FRAGMENT_RE.search(stripped[-4:]):
+        return True
+    return any(stripped.endswith(suffix) for suffix in _TRAILING_FRAGMENT_SUFFIXES)
+
+
+def _qwen_downgrade_source(
+    candidate_rows: dict[str, dict[str, Any]],
+    segment: dict[str, Any],
+    selected_source: str,
+    final_text: str,
+) -> tuple[str, str, list[str]]:
+    if selected_source != "qwen":
+        return selected_source, final_text, []
+    qwen = candidate_rows.get("qwen", {})
+    qwen_alignment = float(qwen.get("local_alignment_score", qwen.get("alignment_score", 0.0)) or 0.0)
+    if qwen_alignment >= 0.82 or not _qwen_trailing_cut_text(final_text):
+        return selected_source, final_text, []
+    scored: list[tuple[float, str, str]] = []
+    for source in ("apple", "whisper"):
+        row = candidate_rows.get(source, {})
+        candidate_text = str(row.get("text", "") if isinstance(row, dict) else "")
+        if not candidate_text:
+            continue
+        combined = float(row.get("combined_score", row.get("alignment_score", 0.0)) or 0.0)
+        if source == "apple":
+            combined += 0.02
+        scored.append((combined, source, candidate_text))
+    if not scored:
+        return selected_source, final_text, []
+    scored.sort(reverse=True)
+    best_score, best_source, best_text = scored[0]
+    qwen_score = float(qwen.get("combined_score", qwen.get("alignment_score", 0.0)) or 0.0)
+    if best_score >= qwen_score:
+        reasons = ["qwen_downgraded_for_trailing_cut"]
+        if best_source == "apple":
+            reasons.append("qwen_alignment_low")
+        return best_source, best_text, reasons
+    return selected_source, final_text, []
+
+
 def _classify_large_span_drift(risk_flags: list[str], qwen_alignment: float) -> list[str]:
     if "large_span_drift" not in risk_flags:
         return risk_flags
@@ -429,6 +473,8 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "review_priority": _normalized_review_text(block.get("review_priority")),
         "human_review_required": human_review_required,
         "machine_review_note": machine_review_note,
+        "llm_target": bool(block.get("llm_target")),
+        "recommended_next_action": _recommended_next_action(block),
         "needs_review": bool(block.get("needs_review")),
         "pre_llm_needs_review": bool(block.get("pre_llm_needs_review")),
         "normalized_needs_review": bool(block.get("normalized_needs_review")),
@@ -467,6 +513,18 @@ def _review_queue_row(block: dict[str, Any]) -> dict[str, Any]:
 
 def _machine_review_note_row(block: dict[str, Any]) -> dict[str, Any]:
     return _review_output_row(block, review_level="machine_note", human_review_required=False, machine_review_note=True)
+
+
+def _recommended_next_action(block: dict[str, Any]) -> str:
+    if block.get("llm_target"):
+        return "llm_review"
+    if block.get("selected_source") == "qwen" and "qwen_downgraded_for_trailing_cut" in (block.get("review_reason") or []):
+        return "prefer_apple_or_whisper"
+    if block.get("review_level") == "human_required":
+        return "human_review"
+    if block.get("review_level") == "machine_note":
+        return "machine_note"
+    return "auto_accept"
 
 
 def _classify_review_level(
@@ -866,18 +924,31 @@ def select_final_candidates(
         final_text = final_text_raw
         confidence = deterministic["confidence"]
         selection_method = deterministic["selection_method"]
+        selected_source, final_text_raw, qwen_downgrade_reasons = _qwen_downgrade_source(
+            candidate_rows,
+            segment,
+            selected_source,
+            final_text_raw,
+        )
+        if qwen_downgrade_reasons:
+            final_text = final_text_raw
+            selection_method = "deterministic_qwen_downgraded"
         pre_llm_needs_review = bool(segment.get("needs_review"))
         normalized_needs_review = bool(segment.get("needs_review"))
         llm_selected = False
         llm_resolved = False
         llm_changed_final_text = False
+        llm_target = False
         review_reason = list(segment.get("risk_flags") or [])
+        if qwen_downgrade_reasons:
+            review_reason = merge_review_reasons(review_reason, qwen_downgrade_reasons)
         llm_decision: LLMDecision | None = None
         should_call = False
         if use_llm and llm_client is not None:
             should_call = str(segment.get("block_id") or "") in llm_target_block_ids and llm_client.should_call(segment, only_risky=llm_only_risky)
             if should_call and risky_calls >= llm_max_segments:
                 should_call = False
+            llm_target = should_call
         if should_call and llm_client is not None:
             stats["llm_used"] = True
             stats["llm_call_count"] += 1
@@ -1108,6 +1179,7 @@ def select_final_candidates(
             "llm_selected": llm_selected,
             "llm_resolved": llm_resolved,
             "llm_changed_final_text": llm_changed_final_text,
+            "llm_target": llm_target,
             "review_reason": review_reason,
             "risk_flags": final_risk_flags,
             "final_risk_flags": final_risk_flags,
@@ -1184,6 +1256,7 @@ def select_final_candidates(
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
+                    "llm_target": llm_target,
                     "review_reason": review_reason,
                     "risk_flags": final_risk_flags,
                     "suggested_final_text": suggested_final_text,
@@ -1287,6 +1360,7 @@ def select_final_candidates(
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
+                    "llm_target": llm_target,
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
@@ -1325,6 +1399,7 @@ def select_final_candidates(
                     "llm_called": bool(should_call),
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
+                    "llm_target": llm_target,
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )

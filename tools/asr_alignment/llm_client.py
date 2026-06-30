@@ -21,6 +21,7 @@ if __package__ is None or __package__ == "":
         normalize_source_choice,
         parse_llm_response,
         safe_mkdir,
+        segment_similarity_score,
     )
 else:
     from ._core import (
@@ -34,6 +35,7 @@ else:
         normalize_source_choice,
         parse_llm_response,
         safe_mkdir,
+        segment_similarity_score,
     )
 
 
@@ -117,6 +119,21 @@ class LLMClient:
         selected_source = str(segment_payload.get("selected_source") or "")
         selected_source_alignment_low = bool(segment_payload.get("selected_source_alignment_low"))
         selected_alignment = float(segment_payload.get("selected_source_alignment_score", 0.0) or 0.0)
+        apple_text = str(segment_payload.get("apple_display_text") or segment_payload.get("apple", {}).get("text", "") or "")
+        whisper_text = str(segment_payload.get("whisper_text") or segment_payload.get("whisper", {}).get("text", "") or "")
+        apple_whisper_similarity = max(
+            segment_similarity_score(apple_text, whisper_text) if apple_text and whisper_text else 0.0,
+            segment_similarity_score(
+                str(segment_payload.get("final_text_display") or segment_payload.get("final_text") or ""),
+                apple_text,
+            )
+            if apple_text
+            else 0.0,
+        )
+        if apple_whisper_similarity >= 0.92 and not any(
+            flag in flags for flag in {"numeric_disagreement", "critical_term_disagreement", "domain_error_phrase", "boundary_contamination_suspected"}
+        ):
+            return False
         if segment_payload.get("numeric_disagreement"):
             return True
         if "critical_term_disagreement" in flags:
