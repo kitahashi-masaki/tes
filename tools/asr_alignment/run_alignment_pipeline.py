@@ -398,6 +398,9 @@ def _build_summary(
         "candidate_refinement_executed_count_by_engine": block_summary.get("candidate_refinement_executed_count_by_engine", {}),
         "candidate_refinement_skipped_count_by_engine": block_summary.get("candidate_refinement_skipped_count_by_engine", {}),
         "candidate_refinement_skipped_reason_counts": block_summary.get("candidate_refinement_skipped_reason_counts", {}),
+        "refinement_search_profile_counts": block_summary.get("refinement_search_profile_counts", {}),
+        "refinement_candidate_eval_sum_by_engine": block_summary.get("refinement_candidate_eval_sum_by_engine", {}),
+        "refinement_candidate_eval_max_by_engine": block_summary.get("refinement_candidate_eval_max_by_engine", {}),
         "qwen_high_confidence_reject_reason_counts": block_summary.get("qwen_high_confidence_reject_reason_counts", {}),
         "qwen_high_confidence_primary_reject_reason_counts": block_summary.get("qwen_high_confidence_primary_reject_reason_counts", {}),
         "candidate_refinement_early_exit_count_by_engine": block_summary.get("candidate_refinement_early_exit_count_by_engine", {}),
@@ -506,6 +509,9 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
     lines.append(f"- refinement skip 理由: {summary.get('candidate_refinement_skipped_reason_counts', {})}")
+    lines.append(f"- refinement search profile: {summary.get('refinement_search_profile_counts', {})}")
+    lines.append(f"- refinement candidate eval 合計: {summary.get('refinement_candidate_eval_sum_by_engine', {})}")
+    lines.append(f"- refinement candidate eval 最大: {summary.get('refinement_candidate_eval_max_by_engine', {})}")
     lines.append(f"- Qwen高信頼skip不可理由: {summary.get('qwen_high_confidence_reject_reason_counts', {})}")
     lines.append(f"- Qwen高信頼skip不可の主理由: {summary.get('qwen_high_confidence_primary_reject_reason_counts', {})}")
     lines.append(f"- 遅いblock ID: {summary.get('candidate_build_slowest_block_ids', [])}")

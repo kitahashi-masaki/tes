@@ -588,48 +588,89 @@ def refine_local_asr_span(
         "drift": 10**9,
     }
     early_exit = False
+    candidate_eval_count = 0
+    target_len_for_profile = max_len - min_len
+    window_span = max(0, window_right - window_left)
+    use_coarse_to_fine = target_len >= 120 or window_span >= 220 or target_len_for_profile >= 80
+    start_step = 4 if use_coarse_to_fine else 2
+    end_step = 4 if use_coarse_to_fine else 2
     upper_start = min(window_right, max(0, asr_norm_len - 1))
-    for start in range(window_left, upper_start + 1, 2):
+
+    def _score_candidate(start: int, end: int) -> None:
+        nonlocal best, early_exit, candidate_eval_count
+        candidate = asr_norm_text[start:end]
+        if not candidate.strip():
+            return
+        candidate_eval_count += 1
+        text_sim = _span_similarity(apple_target, candidate)
+        len_score = 1.0 - min(1.0, abs(len(candidate) - target_len) / max(target_len, len(candidate), 1))
+        boundary_score = 1.0
+        if start <= window_left or end >= window_right:
+            boundary_score -= 0.18
+        if candidate[:1].isspace() or candidate[-1:].isspace():
+            boundary_score -= 0.12
+        local_score = max(0.0, min(1.0, 0.7 * text_sim + 0.2 * len_score + 0.1 * boundary_score))
+        len_delta = abs(len(candidate) - target_len)
+        drift = abs(start - projected_norm_start) + abs(end - projected_norm_end)
+        if (
+            local_score > best["score"]
+            or (local_score == best["score"] and len_delta < best["len_delta"])
+            or (local_score == best["score"] and len_delta == best["len_delta"] and drift < best["drift"])
+            or (local_score == best["score"] and len_delta == best["len_delta"] and drift == best["drift"] and start < best["start"])
+        ):
+            best = {"start": start, "end": end, "score": local_score, "len_delta": len_delta, "drift": drift}
+            span_length_ratio = len(candidate) / max(target_len, 1)
+            boundary_contamination_for_candidate = (
+                not candidate.strip()
+                or candidate[:1].isspace()
+                or candidate[-1:].isspace()
+            )
+            if (
+                local_score >= 0.96
+                and 0.75 <= span_length_ratio <= 1.35
+                and not boundary_contamination_for_candidate
+            ):
+                early_exit = True
+
+    for start in range(window_left, upper_start + 1, start_step):
         min_end = min(asr_norm_len, max(start + min_len, start + 1))
         max_end = min(window_right, start + max_len)
         if min_end > max_end:
             continue
-        for end in range(min_end, max_end + 1, 2):
-            candidate = asr_norm_text[start:end]
-            if not candidate.strip():
-                continue
-            text_sim = _span_similarity(apple_target, candidate)
-            len_score = 1.0 - min(1.0, abs(len(candidate) - target_len) / max(target_len, len(candidate), 1))
-            boundary_score = 1.0
-            if start <= window_left or end >= window_right:
-                boundary_score -= 0.18
-            if candidate[:1].isspace() or candidate[-1:].isspace():
-                boundary_score -= 0.12
-            local_score = max(0.0, min(1.0, 0.7 * text_sim + 0.2 * len_score + 0.1 * boundary_score))
-            len_delta = abs(len(candidate) - target_len)
-            drift = abs(start - projected_norm_start) + abs(end - projected_norm_end)
-            if (
-                local_score > best["score"]
-                or (local_score == best["score"] and len_delta < best["len_delta"])
-                or (local_score == best["score"] and len_delta == best["len_delta"] and drift < best["drift"])
-                or (local_score == best["score"] and len_delta == best["len_delta"] and drift == best["drift"] and start < best["start"])
-            ):
-                best = {"start": start, "end": end, "score": local_score, "len_delta": len_delta, "drift": drift}
-                span_length_ratio = len(candidate) / max(target_len, 1)
-                boundary_contamination_for_candidate = (
-                    not candidate.strip()
-                    or candidate[:1].isspace()
-                    or candidate[-1:].isspace()
-                )
-                if (
-                    local_score >= 0.96
-                    and 0.75 <= span_length_ratio <= 1.35
-                    and not boundary_contamination_for_candidate
-                ):
-                    early_exit = True
-                    break
+        for end in range(min_end, max_end + 1, end_step):
+            _score_candidate(start, end)
+            if early_exit:
+                break
         if early_exit:
             break
+    if use_coarse_to_fine and not early_exit and best["score"] >= 0:
+        fine_anchors = [
+            (int(best["start"]), int(best["end"])),
+            (projected_norm_start, projected_norm_end),
+        ]
+        evaluated_fine_pairs: set[tuple[int, int]] = set()
+        for anchor_start, anchor_end in fine_anchors:
+            fine_window_left = max(window_left, anchor_start - 12)
+            fine_window_right = min(window_right, anchor_start + 12)
+            fine_min_end = max(0, anchor_end - 18)
+            fine_max_end = min(window_right, anchor_end + 18)
+            for start in range(fine_window_left, fine_window_right + 1, 2):
+                min_end = max(start + 1, fine_min_end)
+                max_end = min(fine_max_end, start + max_len, asr_norm_len)
+                if min_end > max_end:
+                    continue
+                for end in range(min_end, max_end + 1, 2):
+                    pair = (start, end)
+                    if pair in evaluated_fine_pairs:
+                        continue
+                    evaluated_fine_pairs.add(pair)
+                    _score_candidate(start, end)
+                    if early_exit:
+                        break
+                if early_exit:
+                    break
+            if early_exit:
+                break
 
     refined_norm_start, refined_norm_end = best["start"], best["end"]
     refined_char_start, refined_char_end = asr_artifact.raw_span_from_norm_range(refined_norm_start, refined_norm_end)
@@ -696,6 +737,10 @@ def refine_local_asr_span(
         "cheap_span_accept": False,
         "cheap_span_accept_reason": "",
         "heavy_refinement_skipped": False,
+        "refinement_search_profile": "coarse_to_fine" if use_coarse_to_fine else "full",
+        "refinement_candidate_eval_count": candidate_eval_count,
+        "refinement_window_span": window_span,
+        "refinement_target_len": target_len,
     }
 
 

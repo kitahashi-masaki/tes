@@ -255,6 +255,10 @@ def _extract_candidate(
             "cheap_span_accept": True,
             "cheap_span_accept_reason": "high_initial_alignment",
             "heavy_refinement_skipped": True,
+            "refinement_search_profile": "cheap_accept",
+            "refinement_candidate_eval_count": 0,
+            "refinement_window_span": 0,
+            "refinement_target_len": len(_normalize_span_text(apple_target)),
             "boundary_hint_used_for_boundary_eval": False,
             "boundary_warning": False,
             "boundary_warning_reason": [],
@@ -302,6 +306,10 @@ def _extract_candidate(
         "cheap_span_accept": bool(refined.get("cheap_span_accept")),
         "cheap_span_accept_reason": refined.get("cheap_span_accept_reason", ""),
         "heavy_refinement_skipped": bool(refined.get("heavy_refinement_skipped")),
+        "refinement_search_profile": refined.get("refinement_search_profile", "full"),
+        "refinement_candidate_eval_count": int(refined.get("refinement_candidate_eval_count", 0) or 0),
+        "refinement_window_span": int(refined.get("refinement_window_span", 0) or 0),
+        "refinement_target_len": int(refined.get("refinement_target_len", 0) or 0),
         "boundary_hint_used_for_boundary_eval": False,
         "boundary_warning": False,
         "boundary_warning_reason": [],
@@ -633,6 +641,9 @@ def build_block_candidates(
     engine_heavy_skipped = Counter()
     engine_early_exit_ids = defaultdict(list)
     skip_reason_counts = Counter()
+    search_profile_counts = Counter()
+    candidate_eval_sum = Counter()
+    candidate_eval_max = Counter()
     qwen_high_confidence_reject_reason_counts = Counter()
     fallback_expanded = Counter()
     search_radius_sum = Counter()
@@ -689,6 +700,11 @@ def build_block_candidates(
                         engine_heavy_skipped[engine] += 1
                     if cand.get("fallback_expanded"):
                         fallback_expanded[engine] += 1
+                    search_profile = str(cand.get("refinement_search_profile") or "unknown")
+                    search_profile_counts[f"{engine}:{search_profile}"] += 1
+                    eval_count = int(cand.get("refinement_candidate_eval_count", 0) or 0)
+                    candidate_eval_sum[engine] += eval_count
+                    candidate_eval_max[engine] = max(candidate_eval_max[engine], eval_count)
             completed += 1
             if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
                 print(
@@ -724,6 +740,16 @@ def build_block_candidates(
                 "qwen_local_alignment_score": row.get("qwen", {}).get("local_alignment_score") if isinstance(row.get("qwen"), dict) else None,
                 "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
                 "risk_flags": row.get("risk_flags", []),
+                "refinement_search_profiles": {
+                    engine: row.get(engine, {}).get("refinement_search_profile")
+                    for engine in ("qwen", "nemotron", "whisper")
+                    if isinstance(row.get(engine), dict)
+                },
+                "refinement_candidate_eval_counts": {
+                    engine: row.get(engine, {}).get("refinement_candidate_eval_count")
+                    for engine in ("qwen", "nemotron", "whisper")
+                    if isinstance(row.get(engine), dict)
+                },
                 "stage_sec": {
                     stage_name: round(float(elapsed), 4)
                     for stage_name, elapsed in (row.get("block_build_sec_by_stage") or {}).items()
@@ -780,6 +806,9 @@ def build_block_candidates(
         "candidate_refinement_executed_count_by_engine": dict(engine_exec),
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
         "candidate_refinement_skipped_reason_counts": dict(skip_reason_counts),
+        "refinement_search_profile_counts": dict(search_profile_counts),
+        "refinement_candidate_eval_sum_by_engine": dict(candidate_eval_sum),
+        "refinement_candidate_eval_max_by_engine": dict(candidate_eval_max),
         "qwen_high_confidence_reject_reason_counts": dict(qwen_high_confidence_reject_reason_counts),
         "qwen_high_confidence_primary_reject_reason_counts": dict(qwen_high_confidence_primary_reject_reason_counts),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
