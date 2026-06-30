@@ -830,6 +830,33 @@ def select_final_candidates(
     previous_end: float | None = None
     risky_calls = 0
     unit_map = {u.sentence_id: u for u in sentence_units}
+
+    llm_target_max_blocks = 10
+    llm_target_block_ids: set[str] = set()
+    llm_target_selection_reasons = Counter()
+    llm_candidate_block_count = 0
+    if use_llm and llm_client is not None:
+        ranked_targets: list[tuple[int, int, str, list[str]]] = []
+        for order, segment in enumerate(block_rows):
+            candidate_rows = {source: segment[source] for source in ("qwen", "apple", "nemotron", "whisper")}
+            _, deterministic = _deterministic_selection(candidate_rows, segment)
+            selected_source = deterministic["selected_source"]
+            final_text = deterministic["final_text"]
+            final_risk_flags = list(segment.get("risk_flags", []) or [])
+            qwen_for_review = segment.get("qwen", {}) if isinstance(segment.get("qwen"), dict) else {}
+            qwen_alignment_for_review = float(qwen_for_review.get("local_alignment_score", qwen_for_review.get("alignment_score", 0.0)) or 0.0)
+            final_risk_flags = _classify_large_span_drift(final_risk_flags, qwen_alignment_for_review)
+            if _has_boundary_contamination_suspect(final_text) and "boundary_contamination_suspected" not in final_risk_flags:
+                final_risk_flags.append("boundary_contamination_suspected")
+            reasons = _llm_target_reasons(segment, final_risk_flags, final_text, selected_source)
+            if reasons:
+                llm_candidate_block_count += 1
+                llm_target_selection_reasons.update(reasons)
+                ranked_targets.append((_llm_target_priority(reasons, segment), order, str(segment.get("block_id") or ""), reasons))
+        ranked_targets.sort(key=lambda item: (-item[0], item[1], item[2]))
+        for _, _, block_id, _ in ranked_targets[:llm_target_max_blocks]:
+            llm_target_block_ids.add(block_id)
+
     for idx, segment in enumerate(block_rows):
         candidate_rows = {source: segment[source] for source in ("qwen", "apple", "nemotron", "whisper")}
         best_source, deterministic = _deterministic_selection(candidate_rows, segment)
@@ -846,7 +873,7 @@ def select_final_candidates(
         llm_decision: LLMDecision | None = None
         should_call = False
         if use_llm and llm_client is not None:
-            should_call = llm_client.should_call(segment, only_risky=llm_only_risky)
+            should_call = str(segment.get("block_id") or "") in llm_target_block_ids and llm_client.should_call(segment, only_risky=llm_only_risky)
             if should_call and risky_calls >= llm_max_segments:
                 should_call = False
         if should_call and llm_client is not None:
@@ -1042,7 +1069,6 @@ def select_final_candidates(
             review_reason = []
         needs_review = human_review_required
         stats["review_level_counts"][review_level] += 1
-
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
             float(segment_time["start_sec"]),
@@ -1295,6 +1321,21 @@ def select_final_candidates(
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
+
+    if use_llm and llm_client is not None:
+        stats["llm_target_max_blocks"] = llm_target_max_blocks
+        stats["llm_candidate_block_count"] = llm_candidate_block_count
+        stats["llm_target_block_count"] = len(llm_target_block_ids)
+        stats["llm_skipped_human_required_count"] = max(0, llm_candidate_block_count - len(llm_target_block_ids))
+        stats["llm_target_selection_reasons"] = dict(llm_target_selection_reasons)
+        stats["llm_target_block_ids"] = list(sorted(llm_target_block_ids))
+    else:
+        stats["llm_target_max_blocks"] = llm_target_max_blocks
+        stats["llm_candidate_block_count"] = 0
+        stats["llm_target_block_count"] = 0
+        stats["llm_skipped_human_required_count"] = 0
+        stats["llm_target_selection_reasons"] = {}
+        stats["llm_target_block_ids"] = []
 
     if output_dir is not None:
         review_rows = [_review_queue_row(row) for row in final_blocks if row.get("human_review_required")]
