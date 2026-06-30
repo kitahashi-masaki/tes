@@ -312,42 +312,132 @@ def _review_reasons_for_flags(risk_flags: list[str]) -> list[str]:
     return [flag for flag in risk_flags if flag not in ignored_when_auto_safe]
 
 
-def _has_unusual_final_text_pattern(text: str) -> bool:
+_UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED = (
+    "19080年代",
+    "ハウスカーなんです",
+    "火復化した家づくり",
+    "倒ブレット",
+    "とろびていない",
+    "遠藤和樹",
+    "円道一樹",
+    "遠藤勝樹",
+    "矢野圭三",
+    "ヤノウ",
+)
+_UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE = (
+    "うのも",
+    "に対して",
+    "、いや",
+    "ほど。はい",
+    "とです",
+    "を言うと",
+    "の陣",
+    "は家",
+    "そうしないと思う",
+    "ね。そうですね",
+    "うことです",
+    "のだから",
+    "野郎",
+)
+
+
+def _unusual_final_text_pattern_level(text: str) -> str | None:
     value = str(text or "").strip()
     if not value:
-        return True
-    suspicious_patterns = (
-        "19080年代",
-        "うのも",
-        "に対して",
-        "、いや",
-        "ほど。はい",
-        "とです",
-        "を言うと",
-        "の陣",
-        "は家",
-        "ハウスカーなんです",
-        "火復化した家づくり",
-        "倒ブレット",
-        "とろびていない",
-        "そうしないと思う",
-        "ね。そうですね",
-        "うことです",
-        "のだから",
-        "遠藤和樹",
-        "円道一樹",
-        "遠藤勝樹",
-        "矢野圭三",
-        "ヤノウ",
-        "野郎",
-    )
-    if any(pattern in value for pattern in suspicious_patterns):
-        return True
+        return "human_required"
+    if any(pattern in value for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_HUMAN_REQUIRED):
+        return "human_required"
+    if any(pattern in value for pattern in _UNUSUAL_FINAL_TEXT_PATTERN_MACHINE_NOTE):
+        return "machine_note"
     if value.startswith(("、", "。")):
-        return True
+        return "machine_note"
     if value.endswith(("ポイ", "簡", "入れ", "そ", "あ", "てる", "中")):
-        return True
-    return False
+        return "machine_note"
+    return None
+
+
+def _has_unusual_final_text_pattern(text: str) -> bool:
+    return _unusual_final_text_pattern_level(text) is not None
+
+
+def _normalized_review_text(value: Any, fallback: str = "") -> str:
+    text = str(value or "").strip()
+    if text:
+        return text
+    fallback_text = str(fallback or "").strip()
+    return fallback_text if fallback_text else "(missing)"
+
+
+def _candidate_texts_for_block(block: dict[str, Any]) -> dict[str, str]:
+    final_text = _normalized_review_text(block.get("final_text_display") or block.get("final_text") or block.get("final_text_raw"))
+    return {
+        "apple": _normalized_review_text(block.get("apple_text"), final_text),
+        "qwen": _normalized_review_text(block.get("qwen_text"), final_text),
+        "nemotron": _normalized_review_text(block.get("nemotron_text"), final_text),
+        "whisper": _normalized_review_text(block.get("whisper_text"), final_text),
+    }
+
+
+def _review_output_row(block: dict[str, Any], *, review_level: str, human_review_required: bool, machine_review_note: bool) -> dict[str, Any]:
+    final_text = _normalized_review_text(block.get("final_text"), block.get("final_text_display"))
+    final_text_display = _normalized_review_text(block.get("final_text_display"), final_text)
+    apple_text = _normalized_review_text(block.get("apple_text"), final_text_display)
+    qwen_text = _normalized_review_text(block.get("qwen_text"), final_text_display)
+    nemotron_text = _normalized_review_text(block.get("nemotron_text"), final_text_display)
+    whisper_text = _normalized_review_text(block.get("whisper_text"), final_text_display)
+    candidate_texts = _candidate_texts_for_block(block)
+    final_risk_flags = list(block.get("final_risk_flags") or block.get("risk_flags") or [])
+    unusual_patterns = [flag for flag in final_risk_flags if flag == "unusual_final_text_pattern"]
+    row = {
+        "episode_id": block.get("episode_id", ""),
+        "block_id": block.get("block_id", ""),
+        "sentence_ids": list(block.get("sentence_ids") or []),
+        "time": {
+            "start_sec": float((block.get("time") or {}).get("start_sec", 0.0) or 0.0),
+            "end_sec": float((block.get("time") or {}).get("end_sec", 0.0) or 0.0),
+        },
+        "review_level": review_level,
+        "review_priority": _normalized_review_text(block.get("review_priority")),
+        "human_review_required": human_review_required,
+        "machine_review_note": machine_review_note,
+        "needs_review": bool(block.get("needs_review")),
+        "pre_llm_needs_review": bool(block.get("pre_llm_needs_review")),
+        "normalized_needs_review": bool(block.get("normalized_needs_review")),
+        "llm_called": bool(block.get("llm_called", block.get("llm_used"))),
+        "llm_selected": bool(block.get("llm_selected")),
+        "llm_resolved": bool(block.get("llm_resolved")),
+        "selected_source": _normalized_review_text(block.get("selected_source")),
+        "selection_method": _normalized_review_text(block.get("selection_method")),
+        "alignment_quality": _normalized_review_text(block.get("alignment_quality")),
+        "qwen_apple_difference_type": _normalized_review_text(block.get("qwen_apple_difference_type")),
+        "qwen_apple_similarity": block.get("qwen_apple_similarity", 0.0),
+        "final_text_raw": final_text,
+        "final_text_display": final_text_display,
+        "apple_text": apple_text,
+        "qwen_text": qwen_text,
+        "nemotron_text": nemotron_text,
+        "whisper_text": whisper_text,
+        "candidate_texts": candidate_texts,
+        "risk_flags": list(block.get("risk_flags") or []),
+        "final_risk_flags": final_risk_flags,
+        "review_gate_reasons": list(block.get("review_gate_reasons") or []),
+        "machine_note_reasons": list(block.get("machine_note_reasons") or []),
+        "unusual_final_text_patterns": unusual_patterns,
+        "review_reason": list(block.get("review_reason") or []),
+    }
+    row["candidate_summary"] = {key: _normalized_review_text(value, final_text_display) for key, value in (block.get("candidate_summary") or {}).items()}
+    row["review_reason"] = list(row["review_reason"]) if isinstance(row["review_reason"], list) else [str(row["review_reason"])]
+    row["review_reason"] = [str(reason) for reason in row["review_reason"] if str(reason)]
+    row["candidate_texts"] = {key: _normalized_review_text(value, final_text_display) for key, value in candidate_texts.items()}
+    return row
+
+
+def _review_queue_row(block: dict[str, Any]) -> dict[str, Any]:
+    return _review_output_row(block, review_level=str(block.get("review_level") or "human_required"), human_review_required=True, machine_review_note=False)
+
+
+def _machine_review_note_row(block: dict[str, Any]) -> dict[str, Any]:
+    return _review_output_row(block, review_level="machine_note", human_review_required=False, machine_review_note=True)
 
 
 def _classify_review_level(
@@ -369,7 +459,6 @@ def _classify_review_level(
         "critical_term_disagreement",
         "boundary_contamination_suspected",
         "domain_error_phrase",
-        "unusual_final_text_pattern",
     }
     if any(flag in reasons for flag in severe_gate_flags):
         gate_reasons.extend([flag for flag in final_risk_flags if flag in severe_gate_flags])
@@ -382,12 +471,31 @@ def _classify_review_level(
         note_reasons.append("qwen_apple_disagreement")
 
     if qwen_alignment < 0.82:
-        if selected_source != "apple":
+        selected_candidate = segment.get(selected_source, {}) if isinstance(segment.get(selected_source), dict) else {}
+        selected_local_alignment = float(selected_candidate.get("local_alignment_score", selected_candidate.get("alignment_score", 0.0)) or 0.0)
+        selected_source_has_local_issue = bool(
+            selected_source == "qwen"
+            or selected_local_alignment < 0.82
+            or selected_candidate.get("boundary_contamination")
+            or selected_candidate.get("span_too_long")
+            or selected_candidate.get("span_too_short")
+        )
+        if selected_source == "qwen":
             gate_reasons.append("qwen_alignment_low")
-        elif any(flag in reasons for flag in {"numeric_disagreement", "critical_term_disagreement", "domain_error_phrase", "unusual_final_text_pattern"}):
+        elif any(flag in reasons for flag in {"numeric_disagreement", "critical_term_disagreement", "domain_error_phrase"}):
+            gate_reasons.append("qwen_alignment_low")
+        elif _unusual_final_text_pattern_level(final_text) == "human_required":
+            gate_reasons.append("qwen_alignment_low")
+        elif selected_source_has_local_issue:
             gate_reasons.append("qwen_alignment_low")
         else:
             note_reasons.append("qwen_alignment_low")
+
+    unusual_level = _unusual_final_text_pattern_level(final_text)
+    if unusual_level == "human_required":
+        gate_reasons.append("unusual_final_text_pattern")
+    elif unusual_level == "machine_note":
+        note_reasons.append("unusual_final_text_pattern")
 
     if "surface_difference" in reasons:
         note_reasons.append("surface_difference")
@@ -880,6 +988,9 @@ def select_final_candidates(
             "block_id": segment["block_id"],
             "sentence_ids": segment["sentence_ids"],
             "time": segment_time,
+            "alignment_quality": segment.get("alignment_quality"),
+            "qwen_apple_difference_type": segment.get("qwen_apple_difference_type"),
+            "qwen_apple_similarity": segment.get("qwen_apple_similarity", 0.0),
             "final_text": final_text,
             "final_text_raw": final_text_before_cleanup,
             "final_text_after_boundary_cleanup": final_text,
@@ -890,6 +1001,7 @@ def select_final_candidates(
             "needs_review": needs_review,
             "pre_llm_needs_review": pre_llm_needs_review,
             "normalized_needs_review": normalized_needs_review,
+            "llm_called": bool(should_call),
             "human_review_required": human_review_required,
             "machine_review_note": machine_review_note,
             "review_level": review_level,
@@ -901,13 +1013,24 @@ def select_final_candidates(
             "llm_resolved": llm_resolved,
             "review_reason": review_reason,
             "risk_flags": final_risk_flags,
+            "final_risk_flags": final_risk_flags,
             "suggested_final_text": suggested_final_text,
             "suggested_final_text_reason": suggestion_reasons,
             "domain_candidate_switched": domain_candidate_switched,
             "domain_text_corrected": domain_text_corrected,
             "domain_text_corrections": domain_text_corrections,
             "candidate_summary": candidate_summary,
+            "candidate_texts": {
+                "apple": candidate_summary.get("apple", ""),
+                "qwen": candidate_summary.get("qwen", ""),
+                "nemotron": candidate_summary.get("nemotron", ""),
+                "whisper": candidate_summary.get("whisper", ""),
+            },
             "apple_display_text": candidate_summary.get("apple", ""),
+            "apple_text": candidate_summary.get("apple", ""),
+            "qwen_text": candidate_summary.get("qwen", ""),
+            "nemotron_text": candidate_summary.get("nemotron", ""),
+            "whisper_text": candidate_summary.get("whisper", ""),
             "apple_boundary_hints": segment_boundary_hints,
             "punctuation_hint_applied": bool(punctuation["punctuation_hints"]),
             "punctuation_hints": punctuation["punctuation_hints"],
@@ -929,6 +1052,7 @@ def select_final_candidates(
             "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
             "selection_notes": llm_decision.notes if llm_decision is not None else "",
             "llm_error": llm_decision.error if llm_decision is not None else "",
+            "unusual_final_text_patterns": [flag for flag in final_risk_flags if flag == "unusual_final_text_pattern"],
         }
         final_blocks.append(block_final)
         for sentence_id in segment["sentence_ids"]:
@@ -971,6 +1095,10 @@ def select_final_candidates(
                     "domain_text_corrections": domain_text_corrections,
                     "candidate_summary": candidate_summary,
                     "apple_display_text": candidate_summary.get("apple", ""),
+                    "apple_text": candidate_summary.get("apple", ""),
+                    "qwen_text": candidate_summary.get("qwen", ""),
+                    "nemotron_text": candidate_summary.get("nemotron", ""),
+                    "whisper_text": candidate_summary.get("whisper", ""),
                     "apple_boundary_hints": segment_boundary_hints,
                     "punctuation_hint_applied": bool(punctuation["punctuation_hints"]),
                     "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
@@ -1000,11 +1128,18 @@ def select_final_candidates(
                     "block_id": segment["block_id"],
                     "sentence_ids": segment["sentence_ids"],
                     "time": segment_time,
+                    "segment_id": segment.get("segment_id"),
                     "needs_review": needs_review,
+                    "human_review_required": human_review_required,
+                    "machine_review_note": machine_review_note,
+                    "review_level": review_level,
+                    "review_priority": review_priority,
                     "review_reason": review_reason,
                     "alignment_quality": segment.get("alignment_quality"),
-                    "risk_flags": final_risk_flags,
+                    "risk_flags": list(segment.get("risk_flags", []) or []),
+                    "final_risk_flags": final_risk_flags,
                     "candidate_summary": candidate_summary,
+                    "candidate_texts": candidate_summary,
                     "final_text": final_text,
                     "suggested_final_text": suggested_final_text,
                     "suggested_final_text_reason": suggestion_reasons,
@@ -1012,9 +1147,20 @@ def select_final_candidates(
                     "domain_text_corrected": domain_text_corrected,
                     "domain_text_corrections": domain_text_corrections,
                     "selected_source": selected_source,
+                    "selection_method": selection_method,
                     "confidence": float(confidence),
+                    "pre_llm_needs_review": pre_llm_needs_review,
+                    "normalized_needs_review": normalized_needs_review,
+                    "llm_called": bool(should_call),
+                    "llm_selected": llm_selected,
+                    "llm_resolved": llm_resolved,
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                     "apple_display_text": candidate_summary.get("apple", ""),
+                    "apple_text": candidate_summary.get("apple", ""),
+                    "qwen_text": candidate_summary.get("qwen", ""),
+                    "nemotron_text": candidate_summary.get("nemotron", ""),
+                    "whisper_text": candidate_summary.get("whisper", ""),
+                    "candidate_texts": candidate_summary,
                     "apple_boundary_hints": segment_boundary_hints,
                     "final_text_raw": final_text_before_cleanup,
                     "final_text_display": punctuation["display_text"],
@@ -1037,6 +1183,11 @@ def select_final_candidates(
                     "review_priority": review_priority,
                     "review_gate_reasons": review_gate_reasons,
                     "machine_note_reasons": machine_note_reasons,
+                    "unusual_final_text_patterns": [final_text] if _has_unusual_final_text_pattern(final_text) else [],
+                    "llm_called": bool(should_call),
+                    "llm_selected": llm_selected,
+                    "llm_resolved": llm_resolved,
+                    "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
         elif machine_review_note:
@@ -1046,6 +1197,7 @@ def select_final_candidates(
                     "block_id": segment["block_id"],
                     "sentence_ids": segment["sentence_ids"],
                     "time": segment_time,
+                    "segment_id": segment.get("segment_id"),
                     "review_level": review_level,
                     "review_priority": review_priority,
                     "machine_review_note": machine_review_note,
@@ -1056,15 +1208,30 @@ def select_final_candidates(
                     "normalized_needs_review": normalized_needs_review,
                     "pre_llm_needs_review": pre_llm_needs_review,
                     "selected_source": selected_source,
+                    "selection_method": selection_method,
                     "confidence": float(confidence),
-                    "risk_flags": final_risk_flags,
+                    "risk_flags": list(segment.get("risk_flags", []) or []),
+                    "final_risk_flags": final_risk_flags,
                     "candidate_summary": candidate_summary,
                     "final_text": final_text,
                     "final_text_display": punctuation["display_text"],
+                    "final_text_raw": final_text_before_cleanup,
+                    "apple_text": candidate_summary.get("apple", ""),
+                    "qwen_text": candidate_summary.get("qwen", ""),
+                    "nemotron_text": candidate_summary.get("nemotron", ""),
+                    "whisper_text": candidate_summary.get("whisper", ""),
+                    "candidate_texts": candidate_summary,
+                    "unusual_final_text_patterns": [final_text] if _has_unusual_final_text_pattern(final_text) else [],
+                    "llm_called": bool(should_call),
+                    "llm_selected": llm_selected,
+                    "llm_resolved": llm_resolved,
+                    "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
 
     if output_dir is not None:
+        review_rows = [_review_queue_row(row) for row in final_blocks if row.get("human_review_required")]
+        machine_review_rows = [_machine_review_note_row(row) for row in final_blocks if row.get("machine_review_note")]
         ensure_dir(output_dir / "fusion")
         save_jsonl(output_dir / "fusion" / f"{episode_id}.final_blocks.jsonl", final_blocks)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.final_segments.jsonl", final_rows)
@@ -1094,6 +1261,8 @@ def select_final_candidates(
             )
         (output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl").write_text("\n".join(sentence_timeline_lines) + ("\n" if sentence_timeline_lines else ""), encoding="utf-8")
 
+    review_rows = [_review_queue_row(row) for row in final_blocks if row.get("human_review_required")]
+    machine_review_rows = [_machine_review_note_row(row) for row in final_blocks if row.get("machine_review_note")]
     stats["machine_review_note_count"] = len(machine_review_rows)
     stats["human_review_required_count"] = len(review_rows)
     stats["auto_accept_final_count"] = sum(1 for row in final_blocks if row.get("review_level") == "auto_accept")

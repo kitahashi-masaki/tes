@@ -402,11 +402,37 @@ def _build_summary(
     final_risk_flag_counts = Counter()
     final_needs_review_reason_counts = Counter()
     review_level_counts = Counter()
+    review_sample_level_counts = Counter()
+    unusual_final_text_pattern_count = 0
+    unusual_final_text_pattern_human_required_count = 0
+    unusual_final_text_pattern_machine_note_count = 0
+    unusual_final_text_patterns_by_level = {"human_required": Counter(), "machine_note": Counter()}
+    qwen_alignment_low_by_selected_source = Counter()
+    qwen_alignment_low_human_required_by_selected_source = Counter()
     for block in final_blocks:
         final_risk_flag_counts.update(block.get("risk_flags", []) or [])
         if block.get("human_review_required") or block.get("needs_review"):
             final_needs_review_reason_counts.update(block.get("human_review_reason") or block.get("review_reason", []) or [])
         review_level_counts[str(block.get("review_level") or "auto_accept")] += 1
+        review_sample_level_counts[str(block.get("review_level") or "auto_accept")] += 1
+        selected_source = str(block.get("selected_source") or "unknown")
+        qwen_alignment = float(block.get("qwen", {}).get("local_alignment_score", 0.0)) if isinstance(block.get("qwen"), dict) else 0.0
+        if qwen_alignment < 0.82:
+            qwen_alignment_low_by_selected_source[selected_source] += 1
+            if block.get("human_review_required"):
+                qwen_alignment_low_human_required_by_selected_source[selected_source] += 1
+        if "unusual_final_text_pattern" in (block.get("final_risk_flags") or block.get("risk_flags") or []):
+            unusual_final_text_pattern_count += 1
+            if block.get("human_review_required"):
+                unusual_final_text_pattern_human_required_count += 1
+                unusual_final_text_patterns_by_level["human_required"].update(
+                    [str(block.get("final_text", ""))[:40]]
+                )
+            elif block.get("machine_review_note"):
+                unusual_final_text_pattern_machine_note_count += 1
+                unusual_final_text_patterns_by_level["machine_note"].update(
+                    [str(block.get("final_text", ""))[:40]]
+                )
     sentence_units = apple_timeline["apple_sentence_units"]
     blocks = apple_timeline["alignment_blocks"]
     if any(unit.get("boundary_hints") for unit in sentence_units):
@@ -438,6 +464,16 @@ def _build_summary(
         "final_block_count": len(final_blocks),
         "final_sentence_timeline_count": len(final_rows),
         "review_level_counts": dict(review_level_counts),
+        "review_sample_level_counts": dict(review_sample_level_counts),
+        "unusual_final_text_pattern_count": unusual_final_text_pattern_count,
+        "unusual_final_text_pattern_human_required_count": unusual_final_text_pattern_human_required_count,
+        "unusual_final_text_pattern_machine_note_count": unusual_final_text_pattern_machine_note_count,
+        "unusual_final_text_patterns_by_level": {
+            "human_required": dict(unusual_final_text_patterns_by_level["human_required"]),
+            "machine_note": dict(unusual_final_text_patterns_by_level["machine_note"]),
+        },
+        "qwen_alignment_low_by_selected_source": dict(qwen_alignment_low_by_selected_source),
+        "qwen_alignment_low_human_required_by_selected_source": dict(qwen_alignment_low_human_required_by_selected_source),
         "candidate_build_wall_sec": block_summary.get("candidate_build_wall_sec", block_summary.get("candidate_build_total_sec")),
         "support_global_alignment_skip_threshold": block_summary.get("support_global_alignment_skip_threshold"),
         "candidate_build_cumulative_stage_sec": block_summary.get("candidate_build_cumulative_stage_sec"),
@@ -693,6 +729,15 @@ def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10)
     review_rows = [row for row in block_rows if row.get("human_review_required")]
     sample_rows: list[dict[str, Any]] = []
     for row in review_rows[:limit]:
+        candidate_texts = row.get("candidate_texts")
+        if not isinstance(candidate_texts, dict):
+            candidate_texts = {
+                engine: row.get(f"{engine}_text", "")
+                for engine in ("apple", "qwen", "nemotron", "whisper")
+            }
+        unusual_patterns = row.get("unusual_final_text_patterns")
+        if not isinstance(unusual_patterns, list):
+            unusual_patterns = [row.get("final_text", "")] if row.get("review_level") == "human_required" and row.get("review_gate_reasons") else []
         sample_rows.append(
             {
                 "episode_id": row.get("episode_id"),
@@ -712,12 +757,18 @@ def _build_review_sample_rows(block_rows: list[dict[str, Any]], limit: int = 10)
                 "qwen_apple_difference_type": row.get("qwen_apple_difference_type"),
                 "qwen_apple_similarity": row.get("qwen_apple_similarity"),
                 "risk_flags": row.get("risk_flags", []),
-                "apple_text": row.get("apple", {}).get("text", ""),
-                "candidate_texts": {
-                    engine: row.get(engine, {}).get("text", "")
-                    for engine in ("qwen", "nemotron", "whisper")
-                    if isinstance(row.get(engine), dict)
-                },
+                "final_risk_flags": row.get("final_risk_flags", row.get("risk_flags", [])),
+                "selected_source": row.get("selected_source"),
+                "selection_method": row.get("selection_method"),
+                "final_text_raw": row.get("final_text_raw", row.get("final_text", "")),
+                "final_text_display": row.get("final_text_display", row.get("final_text", "")),
+                "final_text": row.get("final_text", ""),
+                "apple_text": row.get("apple_text", row.get("apple", {}).get("text", "")),
+                "qwen_text": row.get("qwen_text", row.get("qwen", {}).get("text", "")),
+                "nemotron_text": row.get("nemotron_text", row.get("nemotron", {}).get("text", "")),
+                "whisper_text": row.get("whisper_text", row.get("whisper", {}).get("text", "")),
+                "candidate_texts": candidate_texts,
+                "unusual_final_text_patterns": unusual_patterns,
             }
         )
     return sample_rows
