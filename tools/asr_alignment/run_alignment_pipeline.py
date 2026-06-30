@@ -397,6 +397,7 @@ def _build_summary(
         "candidate_build_sec_by_stage_mean": block_summary.get("candidate_build_sec_by_stage_mean", {}),
         "candidate_refinement_executed_count_by_engine": block_summary.get("candidate_refinement_executed_count_by_engine", {}),
         "candidate_refinement_skipped_count_by_engine": block_summary.get("candidate_refinement_skipped_count_by_engine", {}),
+        "candidate_refinement_skipped_reason_counts": block_summary.get("candidate_refinement_skipped_reason_counts", {}),
         "candidate_refinement_early_exit_count_by_engine": block_summary.get("candidate_refinement_early_exit_count_by_engine", {}),
         "candidate_refinement_early_exit_block_ids_by_engine": block_summary.get("candidate_refinement_early_exit_block_ids_by_engine", {}),
         "cheap_span_accept_count_by_engine": block_summary.get("cheap_span_accept_count_by_engine", {}),
@@ -499,6 +500,7 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- 自動採用件数: {summary['auto_accepted_count']}")
     lines.append(f"- 自動採用率: {summary['auto_accepted_ratio']}")
     lines.append(f"- usable candidate 数: {summary['usable_candidate_count_by_engine']}")
+    lines.append(f"- refinement skip 理由: {summary.get('candidate_refinement_skipped_reason_counts', {})}")
     lines.append(f"- conversation_boundary_hint_stage: {summary['conversation_boundary_hint_stage']}")
     lines.append(f"- boundary_hint_applied_sources: {summary['boundary_hint_applied_sources']}")
     lines.append(f"- boundary_hint_applied_count_by_source: {summary['boundary_hint_applied_count_by_source']}")

@@ -452,9 +452,10 @@ def _build_block_payload(
     for engine in ("nemotron", "whisper"):
         if skip_support:
             t_skip = time.perf_counter()
+            reason = "qwen_high_confidence" if candidate_build_mode != "qwen-only" else "qwen_only_mode"
             candidate_rows[engine] = _build_placeholder_candidate(
                 source=engine,
-                reason="qwen_high_confidence" if candidate_build_mode != "qwen-only" else "qwen_only_mode",
+                reason=reason,
                 boundary_hints_available=bool(boundary_hints),
             )
             stage_secs["support_candidate_skip_sec"] += time.perf_counter() - t_skip
@@ -610,6 +611,7 @@ def build_block_candidates(
     engine_cheap_accept = Counter()
     engine_heavy_skipped = Counter()
     engine_early_exit_ids = defaultdict(list)
+    skip_reason_counts = Counter()
     fallback_expanded = Counter()
     search_radius_sum = Counter()
     search_radius_max = Counter()
@@ -648,6 +650,8 @@ def build_block_candidates(
                 cand = payload.get(engine, {})
                 if cand.get("skipped"):
                     engine_skip[engine] += 1
+                    reason = str(cand.get("skip_reason") or payload.get("support_candidate_skip_reasons", {}).get(engine) or "unknown")
+                    skip_reason_counts[reason] += 1
                 else:
                     engine_exec[engine] += 1
                     sr = int(cand.get("search_radius", 0) or 0)
@@ -703,6 +707,7 @@ def build_block_candidates(
         },
         "candidate_refinement_executed_count_by_engine": dict(engine_exec),
         "candidate_refinement_skipped_count_by_engine": dict(engine_skip),
+        "candidate_refinement_skipped_reason_counts": dict(skip_reason_counts),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
         "candidate_refinement_early_exit_count_by_engine": dict(engine_early_exit),
         "candidate_refinement_early_exit_block_ids_by_engine": dict(engine_early_exit_ids),
