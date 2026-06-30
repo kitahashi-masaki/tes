@@ -443,6 +443,23 @@ def _final_text_suspicious(text: str) -> bool:
     return _unusual_final_text_pattern_level(value) is not None
 
 
+def _final_text_natural(text: str, candidate_texts: dict[str, str]) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if _final_text_suspicious(value):
+        return False
+    normalized = _normalized_no_punct(value)
+    if len(normalized) < 6:
+        return False
+    return any(
+        segment_similarity_score(value, candidate)
+        >= 0.88
+        for candidate in candidate_texts.values()
+        if str(candidate or "").strip()
+    )
+
+
 def _normalized_no_punct(text: str) -> str:
     return re.sub(r"[\s、。，．,.!?！？「」『』（）()\-‐‑‒–—…]+", "", str(text or ""))
 
@@ -581,6 +598,37 @@ def _deterministic_resolution_decision(block: dict[str, Any], candidate_texts: d
     }
 
 
+def _machine_note_demotion_decision(
+    *,
+    selected_source: str,
+    final_text: str,
+    final_risk_flags: list[str],
+    candidate_texts: dict[str, str],
+    deterministic_resolution: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    if selected_source != "apple":
+        return False, []
+    if not deterministic_resolution.get("deterministic_resolution_available"):
+        return False, []
+    if _final_text_suspicious(final_text):
+        return False, []
+    if not _final_text_natural(final_text, candidate_texts):
+        return False, []
+    flags = set(str(flag) for flag in final_risk_flags)
+    if "numeric_disagreement" in flags or "critical_term_disagreement" in flags or "domain_error_phrase" in flags:
+        return False, []
+    if "boundary_contamination_suspected" in flags or "qwen_apple_disagreement" in flags:
+        reasons = list(deterministic_resolution.get("deterministic_resolution_reason") or [])
+        if "apple_whisper_agreement_high" not in reasons:
+            reasons.insert(0, "apple_whisper_agreement_high")
+        if "support_candidate_boundary_contamination" not in reasons:
+            reasons.append("support_candidate_boundary_contamination")
+        if "final_text_natural" not in reasons:
+            reasons.append("final_text_natural")
+        return True, reasons
+    return False, []
+
+
 def _review_output_row(block: dict[str, Any], *, review_level: str, human_review_required: bool, machine_review_note: bool) -> dict[str, Any]:
     final_text = _normalized_review_text(block.get("final_text"), block.get("final_text_display"))
     final_text_display = _normalized_review_text(block.get("final_text_display"), final_text)
@@ -609,6 +657,8 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "deterministic_resolution_reason": list(block.get("deterministic_resolution_reason") or []),
         "apple_whisper_agreement_high": bool(block.get("apple_whisper_agreement_high")),
         "apple_nemotron_whisper_agreement_high": bool(block.get("apple_nemotron_whisper_agreement_high")),
+        "demoted_from_human_required": bool(block.get("demoted_from_human_required")),
+        "demote_reason": list(block.get("demote_reason") or []),
         "needs_review": bool(block.get("needs_review")),
         "pre_llm_needs_review": bool(block.get("pre_llm_needs_review")),
         "normalized_needs_review": bool(block.get("normalized_needs_review")),
@@ -992,6 +1042,7 @@ def select_final_candidates(
     final_blocks: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
     machine_review_rows: list[dict[str, Any]] = []
+    demoted_review_rows: list[dict[str, Any]] = []
     stats = {
         "llm_used": False,
         "llm_call_count": 0,
@@ -1290,7 +1341,40 @@ def select_final_candidates(
             candidate_summary,
             final_text,
         )
-        if human_review_required and deterministic_resolution["deterministic_resolution_available"]:
+        demote_review, demote_reasons = _machine_note_demotion_decision(
+            selected_source=selected_source,
+            final_text=final_text,
+            final_risk_flags=final_risk_flags,
+            candidate_texts=candidate_summary,
+            deterministic_resolution=deterministic_resolution,
+        )
+        if human_review_required and demote_review:
+            human_review_required = False
+            machine_review_note = True
+            review_level = "machine_note"
+            review_priority = "low"
+            review_gate_reasons = []
+            machine_note_reasons = merge_review_reasons(machine_note_reasons, demote_reasons)
+            review_reason = merge_review_reasons(review_reason, demote_reasons)
+            llm_target = False
+            llm_called = False
+            llm_candidate = False
+            demoted_review_rows.append(
+                {
+                    "episode_id": episode_id,
+                    "block_id": segment["block_id"],
+                    "final_text_display": final_text,
+                    "apple_text": candidate_summary.get("apple", ""),
+                    "qwen_text": candidate_summary.get("qwen", ""),
+                    "nemotron_text": candidate_summary.get("nemotron", ""),
+                    "whisper_text": candidate_summary.get("whisper", ""),
+                    "demote_reason": demote_reasons,
+                    "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
+                    "apple_nemotron_whisper_agreement_high": bool(deterministic_resolution["apple_nemotron_whisper_agreement_high"]),
+                    "final_text_suspicious": _final_text_suspicious(final_text),
+                }
+            )
+        if human_review_required and deterministic_resolution["deterministic_resolution_available"] and not demote_review:
             human_review_required = False
             machine_review_note = True
             review_level = "machine_note"
@@ -1369,6 +1453,8 @@ def select_final_candidates(
             "review_gate_reasons": review_gate_reasons,
             "machine_note_reasons": machine_note_reasons,
             "human_review_reason": human_review_reason,
+            "demote_reason": demote_reasons if demote_review else [],
+            "demoted_from_human_required": bool(demote_review),
             "llm_selected": llm_selected,
             "llm_resolved": llm_resolved,
             "llm_changed_final_text": llm_changed_final_text,
@@ -1642,12 +1728,19 @@ def select_final_candidates(
         save_jsonl(output_dir / "fusion" / f"{episode_id}.final_segments.jsonl", final_rows)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.review_queue.jsonl", review_rows)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl", machine_review_rows)
+        save_jsonl(output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl", demoted_review_rows)
         transcript_lines = [f"# {episode_id}", ""]
         for row in final_blocks:
             start = row["time"]["start_sec"]
             end = row["time"]["end_sec"]
             transcript_lines.append(f"- [{start:.2f}-{end:.2f}] {row.get('final_text_display', row['final_text'])}")
         (output_dir / "fusion" / f"{episode_id}.final_transcript.md").write_text("\n".join(transcript_lines) + "\n", encoding="utf-8")
+        demoted_lines = [f"# {episode_id}", "", "## 降格対象"]
+        for row in demoted_review_rows:
+            demoted_lines.append(
+                f"- {row['block_id']}: {row['final_text_display']} | reasons={row.get('demote_reason', [])}"
+            )
+        (output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md").write_text("\n".join(demoted_lines) + "\n", encoding="utf-8")
         sentence_timeline_lines = []
         for row in final_rows:
             sentence_timeline_lines.append(

@@ -610,6 +610,11 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- review_queue 単位: {summary['review_queue_unit']}")
     lines.append(f"- review_queue と human_review_required の一致: {summary.get('review_queue_matches_human_review_required')}")
     lines.append(f"- review_level_counts: {summary.get('review_level_counts', {})}")
+    lines.append(f"- human_required_before_demote_count: {summary.get('human_required_before_demote_count', 0)}")
+    lines.append(f"- demoted_from_human_to_machine_count: {summary.get('demoted_from_human_to_machine_count', 0)}")
+    lines.append(f"- human_required_after_demote_count: {summary.get('human_required_after_demote_count', 0)}")
+    lines.append(f"- demote_reason_counts: {summary.get('demote_reason_counts', {})}")
+    lines.append(f"- recommended_next_action_counts: {summary.get('recommended_next_action_counts', {})}")
     lines.append(f"- review_sample_level_counts: {summary.get('review_sample_level_counts', {})}")
     lines.append(f"- qwen_alignment_low_by_selected_source: {summary.get('qwen_alignment_low_by_selected_source', {})}")
     lines.append(f"- qwen_alignment_low_human_required_by_selected_source: {summary.get('qwen_alignment_low_human_required_by_selected_source', {})}")
@@ -818,6 +823,11 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
     llm_changed_final_text_count = 0
     llm_no_change_count = 0
     llm_candidate_out_of_set_violation_count = 0
+    human_required_before_demote_count = 0
+    demoted_from_human_to_machine_count = 0
+    human_required_after_demote_count = 0
+    demote_reason_counts = Counter()
+    recommended_next_action_counts = Counter()
 
     def _target_reasons(block: dict[str, Any]) -> list[str]:
         flags = set(str(flag) for flag in (block.get("final_risk_flags") or block.get("risk_flags") or []))
@@ -847,6 +857,11 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
 
     for block in final_blocks:
         selected_source = str(block.get("selected_source") or "unknown")
+        recommended_next_action_counts[str(block.get("recommended_next_action") or "auto_accept")] += 1
+        if block.get("demoted_from_human_required"):
+            demoted_from_human_to_machine_count += 1
+            for reason in block.get("demote_reason") or []:
+                demote_reason_counts[str(reason)] += 1
         if "qwen_alignment_low" in (block.get("review_gate_reasons") or []) or "qwen_alignment_low" in (block.get("machine_note_reasons") or []):
             qwen_alignment_low_by_selected_source[selected_source] += 1
             if block.get("human_review_required"):
@@ -879,6 +894,8 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
                 llm_changed_final_text_count += 1
 
     human_review_required_count = sum(1 for row in final_blocks if row.get("human_review_required"))
+    human_required_after_demote_count = human_review_required_count
+    human_required_before_demote_count = human_review_required_count + demoted_from_human_to_machine_count
     review_queue_row_count = len(review_rows)
     llm_candidate_block_count = sum(1 for row in final_blocks if row.get("llm_candidate"))
     llm_target_block_count = sum(1 for row in final_blocks if row.get("llm_target"))
@@ -895,6 +912,11 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
         "needs_review_count_for_review_queue": review_queue_row_count,
         "review_queue_unit": "block",
         "needs_review_count": human_review_required_count,
+        "human_required_before_demote_count": human_required_before_demote_count,
+        "demoted_from_human_to_machine_count": demoted_from_human_to_machine_count,
+        "human_required_after_demote_count": human_required_after_demote_count,
+        "demote_reason_counts": dict(demote_reason_counts),
+        "recommended_next_action_counts": dict(recommended_next_action_counts),
         "review_queue_matches_human_review_required": human_review_required_count == review_queue_row_count,
         "review_queue_matches_final_blocks": human_review_required_count == review_queue_row_count,
         "review_sample_count": len(review_sample_rows),
@@ -1025,6 +1047,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "normalized_summary_md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
             "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
             "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+            "demoted_review_blocks": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl",
+            "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
         }
         output_validation = {}
         missing_output_files: list[str] = []
@@ -1284,6 +1308,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
         "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
         "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
+        "demoted_review_blocks": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl",
+        "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
     }
     output_validation = {}
     missing_output_files: list[str] = []
