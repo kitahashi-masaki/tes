@@ -46,6 +46,10 @@ def _combined_score(candidate: dict[str, Any], apple_segment: dict[str, Any], so
     qwen_similarity = float(apple_segment.get("qwen_apple_similarity", 0.0) or 0.0) if source == "qwen" else 0.0
     if source != "apple":
         boundary_suspected = bool(candidate.get("boundary_contamination") or _has_boundary_contamination_suspect(candidate_text))
+        boundary_anchor_suspected = _has_candidate_boundary_anchor_mismatch(
+            candidate_text,
+            str(apple_segment.get("apple", {}).get("text", "") or ""),
+        )
         if source != "qwen" and alignment < 0.70:
             risk_penalty += 0.18
         elif source != "qwen" and alignment < 0.82:
@@ -56,6 +60,8 @@ def _combined_score(candidate: dict[str, Any], apple_segment: dict[str, Any], so
             risk_penalty += 0.08
         if boundary_suspected:
             risk_penalty += 0.10
+        if boundary_anchor_suspected:
+            risk_penalty += 0.16
         if candidate.get("span_too_long") or candidate.get("span_too_short"):
             risk_penalty += 0.06
     if source == "qwen":
@@ -152,8 +158,35 @@ _DOMAIN_TEXT_REPLACEMENTS = (
     ("そそれ", "それ"),
     ("今今の日本", "今の日本"),
     ("お伝えましてありました", "お伝えしてありました"),
+    ("つこの8050", "この8050"),
+    ("るということです。ただこれ", "ただこれ"),
+    ("ということです。た", "ということです"),
+    ("ポイントなんですよ。は", "ポイントなんですよ"),
 )
 _TRAILING_FRAGMENT_SUFFIXES = ("、よ", "。聞", "、し", "。し", "でそうす", "とこ", "依")
+
+
+def _boundary_anchor_norm(text: str) -> str:
+    return re.sub(r"[\s、。，．,.!?！？]+", "", str(text or ""))
+
+
+def _has_candidate_boundary_anchor_mismatch(candidate_text: str, apple_text: str) -> bool:
+    candidate = _boundary_anchor_norm(candidate_text)
+    apple = _boundary_anchor_norm(apple_text)
+    if len(candidate) < 12 or len(apple) < 12:
+        return False
+    anchor_len = min(10, max(5, len(apple) // 8))
+    prefix = apple[:anchor_len]
+    suffix = apple[-anchor_len:]
+    head = candidate[: max(24, anchor_len * 4)]
+    tail = candidate[-max(24, anchor_len * 4):]
+    prefix_pos = head.find(prefix)
+    suffix_pos = tail.rfind(suffix)
+    if prefix_pos > 3:
+        return True
+    if suffix_pos >= 0 and len(tail) - (suffix_pos + len(suffix)) > 3:
+        return True
+    return False
 
 
 def _has_boundary_contamination_suspect(text: str) -> bool:

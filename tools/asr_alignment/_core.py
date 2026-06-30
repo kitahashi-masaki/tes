@@ -588,6 +588,13 @@ def refine_local_asr_span(
             "cheap_span_accept": True,
             "cheap_span_accept_reason": "high_initial_alignment",
             "heavy_refinement_skipped": True,
+            "refinement_search_profile": "initial_early_exit",
+            "refinement_candidate_eval_count": 0,
+            "refinement_candidate_pruned_count": 0,
+            "refinement_window_span": 0,
+            "refinement_target_len": apple_norm_len,
+            "refinement_start_candidate_count": 0,
+            "refinement_end_candidate_count": 0,
         }
 
     target_len = max(apple_norm_end - apple_norm_start, 1)
@@ -612,6 +619,68 @@ def refine_local_asr_span(
     start_step = 4 if use_coarse_to_fine else 2
     end_step = 4 if use_coarse_to_fine else 2
     upper_start = min(window_right, max(0, asr_norm_len - 1))
+    start_candidate_count = 0
+    end_candidate_count = 0
+
+    def _bounded_start_candidates() -> list[int]:
+        scored: dict[int, float] = {}
+
+        def add(start: int, score: float) -> None:
+            if window_left <= start <= upper_start:
+                scored[start] = max(scored.get(start, 0.0), score)
+
+        for delta in range(-36, 37, 4):
+            add(projected_norm_start + delta, 6.0 - abs(delta) / 18.0)
+
+        coarse_stride = max(8, min(20, target_len // 8 or 8))
+        for start in range(window_left, upper_start + 1, coarse_stride):
+            add(start, 1.0)
+
+        qgram_len = 4 if target_len >= 80 else 3
+        if len(apple_target) >= qgram_len:
+            q_positions = list(range(0, len(apple_target) - qgram_len + 1, max(2, qgram_len)))
+            q_positions.extend([0, max(0, len(apple_target) - qgram_len)])
+            seen_grams: set[tuple[str, int]] = set()
+            window_text = asr_norm_text[window_left:window_right]
+            for qpos in q_positions:
+                gram = apple_target[qpos:qpos + qgram_len]
+                if not gram.strip() or (gram, qpos) in seen_grams:
+                    continue
+                seen_grams.add((gram, qpos))
+                found = window_text.find(gram)
+                hits = 0
+                while found >= 0 and hits < 8:
+                    anchor_start = window_left + found - qpos
+                    for delta in (-4, 0, 4):
+                        add(anchor_start + delta, 4.0 + max(0.0, 1.0 - hits / 8.0))
+                    hits += 1
+                    found = window_text.find(gram, found + 1)
+
+        max_starts = 72
+        ranked = sorted(scored, key=lambda start: (-scored[start], abs(start - projected_norm_start), start))
+        return sorted(ranked[:max_starts])
+
+    def _bounded_end_candidates(start: int) -> list[int]:
+        min_end = min(asr_norm_len, max(start + min_len, start + 1))
+        max_end = min(window_right, start + max_len)
+        if min_end > max_end:
+            return []
+        ends: set[int] = set()
+
+        def add(end: int) -> None:
+            if min_end <= end <= max_end:
+                ends.add(end)
+
+        len_delta_limit = max(12, min(48, target_len // 5))
+        for delta in range(-len_delta_limit, len_delta_limit + 1, 4):
+            add(start + target_len + delta)
+        for delta in range(-24, 25, 8):
+            add(projected_norm_end + delta)
+        add(start + min_len)
+        add(start + max_len)
+        add(min_end)
+        add(max_end)
+        return sorted(ends)
 
     def _score_candidate(start: int, end: int) -> None:
         nonlocal best, early_exit, candidate_eval_count, candidate_pruned_count
@@ -654,12 +723,19 @@ def refine_local_asr_span(
             ):
                 early_exit = True
 
-    for start in range(window_left, upper_start + 1, start_step):
-        min_end = min(asr_norm_len, max(start + min_len, start + 1))
-        max_end = min(window_right, start + max_len)
-        if min_end > max_end:
-            continue
-        for end in range(min_end, max_end + 1, end_step):
+    start_values = _bounded_start_candidates() if use_coarse_to_fine else list(range(window_left, upper_start + 1, start_step))
+    start_candidate_count += len(start_values)
+    for start in start_values:
+        if use_coarse_to_fine:
+            end_values = _bounded_end_candidates(start)
+        else:
+            min_end = min(asr_norm_len, max(start + min_len, start + 1))
+            max_end = min(window_right, start + max_len)
+            if min_end > max_end:
+                continue
+            end_values = list(range(min_end, max_end + 1, end_step))
+        end_candidate_count += len(end_values)
+        for end in end_values:
             _score_candidate(start, end)
             if early_exit:
                 break
@@ -686,6 +762,7 @@ def refine_local_asr_span(
                     if pair in evaluated_fine_pairs:
                         continue
                     evaluated_fine_pairs.add(pair)
+                    end_candidate_count += 1
                     _score_candidate(start, end)
                     if early_exit:
                         break
@@ -759,11 +836,13 @@ def refine_local_asr_span(
         "cheap_span_accept": False,
         "cheap_span_accept_reason": "",
         "heavy_refinement_skipped": False,
-        "refinement_search_profile": "coarse_to_fine" if use_coarse_to_fine else "full",
+        "refinement_search_profile": "coarse_to_fine_bounded" if use_coarse_to_fine else "full",
         "refinement_candidate_eval_count": candidate_eval_count,
         "refinement_candidate_pruned_count": candidate_pruned_count,
         "refinement_window_span": window_span,
         "refinement_target_len": target_len,
+        "refinement_start_candidate_count": start_candidate_count,
+        "refinement_end_candidate_count": end_candidate_count,
     }
 
 

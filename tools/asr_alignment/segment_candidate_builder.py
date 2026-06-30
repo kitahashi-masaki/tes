@@ -315,6 +315,8 @@ def _extract_candidate(
         "refinement_candidate_pruned_count": int(refined.get("refinement_candidate_pruned_count", 0) or 0),
         "refinement_window_span": int(refined.get("refinement_window_span", 0) or 0),
         "refinement_target_len": int(refined.get("refinement_target_len", 0) or 0),
+        "refinement_start_candidate_count": int(refined.get("refinement_start_candidate_count", 0) or 0),
+        "refinement_end_candidate_count": int(refined.get("refinement_end_candidate_count", 0) or 0),
         "boundary_hint_used_for_boundary_eval": False,
         "boundary_warning": False,
         "boundary_warning_reason": [],
@@ -349,6 +351,13 @@ def _build_placeholder_candidate(*, source: str, reason: str, boundary_hints_ava
         "fallback_expand_reason": [],
         "early_exit": False,
         "early_exit_reason": "",
+        "refinement_search_profile": "skipped",
+        "refinement_candidate_eval_count": 0,
+        "refinement_candidate_pruned_count": 0,
+        "refinement_window_span": 0,
+        "refinement_target_len": 0,
+        "refinement_start_candidate_count": 0,
+        "refinement_end_candidate_count": 0,
         "boundary_hint_used_for_boundary_eval": False,
         "boundary_warning": False,
         "boundary_warning_reason": [],
@@ -661,6 +670,10 @@ def build_block_candidates(
     candidate_eval_max = Counter()
     candidate_pruned_sum = Counter()
     candidate_pruned_max = Counter()
+    start_candidate_sum = Counter()
+    start_candidate_max = Counter()
+    end_candidate_sum = Counter()
+    end_candidate_max = Counter()
     qwen_high_confidence_reject_reason_counts = Counter()
     fallback_expanded = Counter()
     search_radius_sum = Counter()
@@ -725,6 +738,12 @@ def build_block_candidates(
                     pruned_count = int(cand.get("refinement_candidate_pruned_count", 0) or 0)
                     candidate_pruned_sum[engine] += pruned_count
                     candidate_pruned_max[engine] = max(candidate_pruned_max[engine], pruned_count)
+                    start_count = int(cand.get("refinement_start_candidate_count", 0) or 0)
+                    start_candidate_sum[engine] += start_count
+                    start_candidate_max[engine] = max(start_candidate_max[engine], start_count)
+                    end_count = int(cand.get("refinement_end_candidate_count", 0) or 0)
+                    end_candidate_sum[engine] += end_count
+                    end_candidate_max[engine] = max(end_candidate_max[engine], end_count)
             completed += 1
             if completed == 1 or completed % 5 == 0 or completed == len(alignment_blocks):
                 print(
@@ -772,6 +791,16 @@ def build_block_candidates(
                 },
                 "refinement_candidate_pruned_counts": {
                     engine: row.get(engine, {}).get("refinement_candidate_pruned_count")
+                    for engine in ("qwen", "nemotron", "whisper")
+                    if isinstance(row.get(engine), dict)
+                },
+                "refinement_start_candidate_counts": {
+                    engine: row.get(engine, {}).get("refinement_start_candidate_count")
+                    for engine in ("qwen", "nemotron", "whisper")
+                    if isinstance(row.get(engine), dict)
+                },
+                "refinement_end_candidate_counts": {
+                    engine: row.get(engine, {}).get("refinement_end_candidate_count")
                     for engine in ("qwen", "nemotron", "whisper")
                     if isinstance(row.get(engine), dict)
                 },
@@ -840,6 +869,10 @@ def build_block_candidates(
         "refinement_candidate_eval_max_by_engine": dict(candidate_eval_max),
         "refinement_candidate_pruned_sum_by_engine": dict(candidate_pruned_sum),
         "refinement_candidate_pruned_max_by_engine": dict(candidate_pruned_max),
+        "refinement_start_candidate_sum_by_engine": dict(start_candidate_sum),
+        "refinement_start_candidate_max_by_engine": dict(start_candidate_max),
+        "refinement_end_candidate_sum_by_engine": dict(end_candidate_sum),
+        "refinement_end_candidate_max_by_engine": dict(end_candidate_max),
         "qwen_high_confidence_reject_reason_counts": dict(qwen_high_confidence_reject_reason_counts),
         "qwen_high_confidence_primary_reject_reason_counts": dict(qwen_high_confidence_primary_reject_reason_counts),
         "candidate_refinement_cache_hit_count_by_engine": dict(engine_cache_hit),
