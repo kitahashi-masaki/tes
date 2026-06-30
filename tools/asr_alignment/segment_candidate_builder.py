@@ -203,8 +203,9 @@ def _extract_candidate(
     initial_text = engine_artifact.raw_text[initial_char_start:initial_char_end].strip() or engine_artifact.raw_text_from_norm_range(projected_start, projected_end).strip()
     if not initial_text:
         initial_text = engine_artifact.raw_text[: min(len(engine_artifact.raw_text), max(2, apple_span))]
-    initial_local_alignment_score = max(float(cheap_span.get("score", 0.0)), max(0.0, min(1.0, _span_similarity(apple_target, initial_text))))
-    span_length_ratio = len(_normalize_span_text(initial_text)) / max(len(_normalize_span_text(apple_target)), 1)
+    initial_norm_text = _normalize_span_text(initial_text)
+    initial_local_alignment_score = max(float(cheap_span.get("score", 0.0)), max(0.0, min(1.0, _match_span_similarity(apple_target, initial_norm_text))))
+    span_length_ratio = len(initial_norm_text) / max(len(apple_target), 1)
     initial_diff_type, _, initial_critical = classify_qwen_apple_difference(apple_raw_text, initial_text)
     initial_numeric_disagreement = _has_numeric_disagreement(apple_raw_text, initial_text)
     boundary_contamination = (
@@ -245,8 +246,8 @@ def _extract_candidate(
             "span_drift_start": 0,
             "span_drift_end": 0,
             "boundary_contamination": False,
-            "usable_for_agreement": len(_normalize_span_text(initial_text)) > 2,
-            "unusable_reason": "" if len(_normalize_span_text(initial_text)) > 2 else "too_short",
+            "usable_for_agreement": len(initial_norm_text) > 2,
+            "unusable_reason": "" if len(initial_norm_text) > 2 else "too_short",
             "search_radius": search_radius,
             "source": source,
             "search_radius_initial": search_radius,
@@ -262,7 +263,7 @@ def _extract_candidate(
             "refinement_candidate_eval_count": 0,
             "refinement_candidate_pruned_count": 0,
             "refinement_window_span": 0,
-            "refinement_target_len": len(_normalize_span_text(apple_target)),
+            "refinement_target_len": len(apple_target),
             "boundary_hint_used_for_boundary_eval": False,
             "boundary_warning": False,
             "boundary_warning_reason": [],
