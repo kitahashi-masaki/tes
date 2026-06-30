@@ -132,6 +132,17 @@ _LEAN_VALIDATION_SUFFIXES = ("ポイ", "簡", "入れ", "そ", "あ", "てる", 
 _BOUNDARY_CONTAMINATION_SUSPECT_PREFIXES = ("ね。", "うことです", "のだから", "ですよね。", "したね。", "ということです")
 _BOUNDARY_CONTAMINATION_SUSPECT_SUFFIXES = ("あるん", "位置づ")
 _DOMAIN_ERROR_PHRASES = ("排水の陣", "各家族", "社会行動", "整形立てて")
+_DOMAIN_TEXT_REPLACEMENTS = (
+    ("排水の陣", "背水の陣"),
+    ("各家族", "核家族"),
+    ("社会行動", "社会構造"),
+    ("整形立て", "生計立て"),
+    ("DMA", "DNA"),
+    ("ＤＭＡ", "DNA"),
+    ("大加速性", "大家族性"),
+    ("太路", "退路"),
+    ("退路立った", "退路を断った"),
+)
 _TRAILING_FRAGMENT_SUFFIXES = ("、よ", "。聞", "、し", "。し", "でそうす", "とこ", "依")
 
 
@@ -145,6 +156,16 @@ def _has_boundary_contamination_suspect(text: str) -> bool:
 
 def _contains_domain_error(text: str) -> bool:
     return any(phrase in str(text or "") for phrase in _DOMAIN_ERROR_PHRASES)
+
+
+def _apply_domain_text_corrections(text: str) -> tuple[str, list[dict[str, str]]]:
+    corrected = str(text or "")
+    applied: list[dict[str, str]] = []
+    for wrong, right in _DOMAIN_TEXT_REPLACEMENTS:
+        if wrong in corrected:
+            corrected = corrected.replace(wrong, right)
+            applied.append({"from": wrong, "to": right})
+    return corrected, applied
 
 
 def _without_leading_fragment_suggestion(text: str, apple_text: str) -> tuple[str, list[str]]:
@@ -439,6 +460,8 @@ def select_final_candidates(
         "cleanup_reverted_by_punctuation_hint_count": 0,
         "domain_candidate_switch_count": 0,
         "domain_error_avoided_count": 0,
+        "domain_text_correction_count": 0,
+        "domain_text_corrected_block_count": 0,
         "suggested_final_text_count": 0,
         "boundary_suggestion_count": 0,
         "trailing_boundary_suggestion_count": 0,
@@ -553,8 +576,15 @@ def select_final_candidates(
         if cleanup["boundary_cleanup_applied"]:
             review_reason = merge_review_reasons(review_reason, cleanup["boundary_cleanup_reason"])
         cleanup_needs_review = bool(cleanup.get("boundary_cleanup_needs_review"))
+        final_text_before_domain_correction = final_text
+        final_text, domain_text_corrections = _apply_domain_text_corrections(final_text)
+        domain_text_corrected = bool(domain_text_corrections)
+        if domain_text_corrected:
+            stats["domain_text_corrected_block_count"] += 1
+            stats["domain_text_correction_count"] += len(domain_text_corrections)
+            review_reason = merge_review_reasons(review_reason, ["domain_text_corrected"])
 
-        display_source_text = _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
+        display_source_text = final_text if domain_text_corrected else _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
         punctuation = {
             "display_text": display_source_text,
             "punctuation_hints": [],
@@ -584,6 +614,8 @@ def select_final_candidates(
             final_risk_flags = [flag for flag in final_risk_flags if flag != "domain_error_phrase"]
             final_risk_flags.append("domain_error_avoided")
             stats["domain_error_avoided_count"] += 1
+        if domain_text_corrected and "domain_text_corrected" not in final_risk_flags:
+            final_risk_flags.append("domain_text_corrected")
         if "large_span_drift_warning" in final_risk_flags:
             stats["large_span_drift_warning_count"] += 1
         if _has_boundary_contamination_suspect(final_text) or _has_boundary_contamination_suspect(punctuation["display_text"]):
@@ -638,6 +670,8 @@ def select_final_candidates(
             "suggested_final_text": suggested_final_text,
             "suggested_final_text_reason": suggestion_reasons,
             "domain_candidate_switched": domain_candidate_switched,
+            "domain_text_corrected": domain_text_corrected,
+            "domain_text_corrections": domain_text_corrections,
             "candidate_summary": candidate_summary,
             "apple_display_text": candidate_summary.get("apple", ""),
             "apple_boundary_hints": segment_boundary_hints,
@@ -650,6 +684,7 @@ def select_final_candidates(
             "boundary_hint_used_count": punctuation["boundary_hint_used_count"],
             "final_text_before_cleanup": final_text_before_cleanup,
             "final_text_after_cleanup": final_text,
+            "final_text_before_domain_correction": final_text_before_domain_correction,
             "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
             "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
             "boundary_cleanup_attempted": bool(cleanup.get("boundary_cleanup_attempted")),
@@ -687,6 +722,8 @@ def select_final_candidates(
                     "suggested_final_text": suggested_final_text,
                     "suggested_final_text_reason": suggestion_reasons,
                     "domain_candidate_switched": domain_candidate_switched,
+                    "domain_text_corrected": domain_text_corrected,
+                    "domain_text_corrections": domain_text_corrections,
                     "candidate_summary": candidate_summary,
                     "apple_display_text": candidate_summary.get("apple", ""),
                     "apple_boundary_hints": segment_boundary_hints,
@@ -698,6 +735,7 @@ def select_final_candidates(
                     "boundary_hint_used_count": punctuation["boundary_hint_used_count"],
                     "final_text_before_cleanup": final_text_before_cleanup,
                     "final_text_after_cleanup": final_text,
+                    "final_text_before_domain_correction": final_text_before_domain_correction,
                     "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
                     "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
                     "boundary_cleanup_attempted": bool(cleanup.get("boundary_cleanup_attempted")),
@@ -726,6 +764,8 @@ def select_final_candidates(
                     "suggested_final_text": suggested_final_text,
                     "suggested_final_text_reason": suggestion_reasons,
                     "domain_candidate_switched": domain_candidate_switched,
+                    "domain_text_corrected": domain_text_corrected,
+                    "domain_text_corrections": domain_text_corrections,
                     "selected_source": selected_source,
                     "confidence": float(confidence),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
@@ -741,6 +781,7 @@ def select_final_candidates(
                     "boundary_hint_used_count": punctuation["boundary_hint_used_count"],
                     "final_text_before_cleanup": final_text_before_cleanup,
                     "final_text_after_cleanup": final_text,
+                    "final_text_before_domain_correction": final_text_before_domain_correction,
                     "boundary_cleanup_applied": bool(cleanup["boundary_cleanup_applied"]),
                     "boundary_cleanup_reason": cleanup["boundary_cleanup_reason"],
                     "boundary_cleanup_attempted": bool(cleanup.get("boundary_cleanup_attempted")),

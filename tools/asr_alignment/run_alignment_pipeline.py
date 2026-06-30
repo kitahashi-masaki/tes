@@ -237,6 +237,8 @@ def _build_summary(
     boundary_suggestion_count = 0
     domain_candidate_switch_count = 0
     domain_error_avoided_count = 0
+    domain_text_corrected_block_count = 0
+    domain_text_correction_count = 0
     trailing_boundary_suggestion_count = 0
     large_span_drift_warning_count = 0
     boundary_hint_used_in_alignment_blocking = False
@@ -352,6 +354,9 @@ def _build_summary(
             trailing_boundary_suggestion_count += 1
         if block.get("domain_candidate_switched"):
             domain_candidate_switch_count += 1
+        if block.get("domain_text_corrected"):
+            domain_text_corrected_block_count += 1
+            domain_text_correction_count += len(block.get("domain_text_corrections") or [])
         if "domain_error_avoided" in (block.get("risk_flags") or []):
             domain_error_avoided_count += 1
         if "large_span_drift_warning" in (block.get("risk_flags") or []):
@@ -457,6 +462,8 @@ def _build_summary(
         "trailing_boundary_suggestion_count": trailing_boundary_suggestion_count,
         "domain_candidate_switch_count": domain_candidate_switch_count,
         "domain_error_avoided_count": domain_error_avoided_count,
+        "domain_text_corrected_block_count": domain_text_corrected_block_count,
+        "domain_text_correction_count": domain_text_correction_count,
         "large_span_drift_warning_count": large_span_drift_warning_count,
         "auto_accepted_count": auto_accepted_count,
         "auto_accepted_ratio": round(auto_accepted_count / max(len(block_rows), 1), 3),
@@ -570,6 +577,8 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- trailing boundary suggestion 件数: {summary.get('trailing_boundary_suggestion_count', 0)}")
     lines.append(f"- domain candidate switch 件数: {summary.get('domain_candidate_switch_count', 0)}")
     lines.append(f"- domain error avoided 件数: {summary.get('domain_error_avoided_count', 0)}")
+    lines.append(f"- domain text corrected block 件数: {summary.get('domain_text_corrected_block_count', 0)}")
+    lines.append(f"- domain text correction 件数: {summary.get('domain_text_correction_count', 0)}")
     lines.append(f"- large span drift warning 件数: {summary.get('large_span_drift_warning_count', 0)}")
     lines.append(f"- regression_phrase_counts: {summary.get('regression_phrase_counts', {})}")
     lines.append(f"- domain_error_phrase_counts: {summary.get('domain_error_phrase_counts', {})}")
