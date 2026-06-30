@@ -451,6 +451,100 @@ def _candidate_texts_for_block(block: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _candidate_agreement_metrics(candidate_texts: dict[str, str]) -> dict[str, Any]:
+    apple = str(candidate_texts.get("apple") or "")
+    qwen = str(candidate_texts.get("qwen") or "")
+    nemotron = str(candidate_texts.get("nemotron") or "")
+    whisper = str(candidate_texts.get("whisper") or "")
+
+    def _sim(a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        return float(segment_similarity_score(a, b))
+
+    apple_whisper = _sim(apple, whisper)
+    apple_nemotron = _sim(apple, nemotron)
+    nemotron_whisper = _sim(nemotron, whisper)
+    apple_nemotron_whisper = min(apple_whisper, apple_nemotron, nemotron_whisper) if all((apple, nemotron, whisper)) else 0.0
+    apple_whisper_agreement_high = apple_whisper >= 0.92
+    apple_nemotron_whisper_agreement_high = apple_nemotron_whisper >= 0.90
+    qwen_apple_similarity = _sim(qwen, apple)
+    qwen_whisper_similarity = _sim(qwen, whisper)
+    qwen_boundary_tainted = (
+        _has_boundary_contamination_suspect(qwen)
+        or _qwen_trailing_cut_text(qwen)
+        or qwen_apple_similarity < 0.86
+        or qwen_whisper_similarity < 0.86
+    )
+    return {
+        "apple_whisper_similarity": apple_whisper,
+        "apple_nemotron_similarity": apple_nemotron,
+        "nemotron_whisper_similarity": nemotron_whisper,
+        "apple_whisper_agreement_high": apple_whisper_agreement_high,
+        "apple_nemotron_whisper_agreement_high": apple_nemotron_whisper_agreement_high,
+        "qwen_apple_similarity": qwen_apple_similarity,
+        "qwen_whisper_similarity": qwen_whisper_similarity,
+        "qwen_boundary_tainted": qwen_boundary_tainted,
+    }
+
+
+def _deterministic_resolution_decision(block: dict[str, Any], candidate_texts: dict[str, str], final_text: str) -> dict[str, Any]:
+    metrics = _candidate_agreement_metrics(candidate_texts)
+    selected_source = str(block.get("selected_source") or "")
+    final_text_display = str(block.get("final_text_display") or final_text or "")
+    severe_flags = {
+        "critical_term_disagreement",
+        "numeric_disagreement",
+        "domain_error_phrase",
+    }
+    remaining_flags = set(str(flag) for flag in (block.get("final_risk_flags") or block.get("risk_flags") or []))
+    if selected_source != "apple":
+        return {
+            "deterministic_resolution_available": False,
+            "deterministic_resolution_reason": [],
+            "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+        }
+    if not metrics["apple_whisper_agreement_high"] and not metrics["apple_nemotron_whisper_agreement_high"]:
+        return {
+            "deterministic_resolution_available": False,
+            "deterministic_resolution_reason": [],
+            "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+        }
+    if any(flag in remaining_flags for flag in severe_flags):
+        return {
+            "deterministic_resolution_available": False,
+            "deterministic_resolution_reason": [],
+            "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+        }
+    if _has_unusual_final_text_pattern(final_text_display):
+        return {
+            "deterministic_resolution_available": False,
+            "deterministic_resolution_reason": [],
+            "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+        }
+    if not metrics["qwen_boundary_tainted"]:
+        return {
+            "deterministic_resolution_available": False,
+            "deterministic_resolution_reason": [],
+            "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+        }
+    reasons = ["apple_whisper_agreement_high"]
+    if metrics["apple_nemotron_whisper_agreement_high"]:
+        reasons.append("apple_nemotron_whisper_agreement_high")
+    reasons.append("support_candidate_boundary_contamination")
+    return {
+        "deterministic_resolution_available": True,
+        "deterministic_resolution_reason": reasons,
+        "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+        "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+    }
+
+
 def _review_output_row(block: dict[str, Any], *, review_level: str, human_review_required: bool, machine_review_note: bool) -> dict[str, Any]:
     final_text = _normalized_review_text(block.get("final_text"), block.get("final_text_display"))
     final_text_display = _normalized_review_text(block.get("final_text_display"), final_text)
@@ -475,6 +569,10 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "machine_review_note": machine_review_note,
         "llm_target": bool(block.get("llm_target")),
         "recommended_next_action": _recommended_next_action(block),
+        "deterministic_resolution_available": bool(block.get("deterministic_resolution_available")),
+        "deterministic_resolution_reason": list(block.get("deterministic_resolution_reason") or []),
+        "apple_whisper_agreement_high": bool(block.get("apple_whisper_agreement_high")),
+        "apple_nemotron_whisper_agreement_high": bool(block.get("apple_nemotron_whisper_agreement_high")),
         "needs_review": bool(block.get("needs_review")),
         "pre_llm_needs_review": bool(block.get("pre_llm_needs_review")),
         "normalized_needs_review": bool(block.get("normalized_needs_review")),
@@ -518,6 +616,8 @@ def _machine_review_note_row(block: dict[str, Any]) -> dict[str, Any]:
 def _recommended_next_action(block: dict[str, Any]) -> str:
     if block.get("llm_target"):
         return "llm_review"
+    if block.get("deterministic_resolution_available"):
+        return "machine_note"
     if block.get("selected_source") == "qwen" and "qwen_downgraded_for_trailing_cut" in (block.get("review_reason") or []):
         return "prefer_apple_or_whisper"
     if block.get("review_level") == "human_required":
@@ -1110,6 +1210,27 @@ def select_final_candidates(
         review_priority = str(review_classification["review_priority"])
         review_gate_reasons = list(review_classification["review_gate_reasons"])
         machine_note_reasons = list(review_classification["machine_note_reasons"])
+        deterministic_resolution = _deterministic_resolution_decision(
+            {
+                "selected_source": selected_source,
+                "final_risk_flags": final_risk_flags,
+                "risk_flags": final_risk_flags,
+                "final_text_display": final_text,
+            },
+            candidate_summary,
+            final_text,
+        )
+        if human_review_required and deterministic_resolution["deterministic_resolution_available"]:
+            human_review_required = False
+            machine_review_note = True
+            review_level = "machine_note"
+            review_priority = "low"
+            review_gate_reasons = []
+            machine_note_reasons = merge_review_reasons(
+                machine_note_reasons,
+                deterministic_resolution["deterministic_resolution_reason"],
+            )
+            review_reason = merge_review_reasons(review_reason, deterministic_resolution["deterministic_resolution_reason"])
         if llm_selected and selected_source != deterministic["selected_source"]:
             llm_resolved = True
             stats["llm_resolved_count"] += 1
@@ -1180,6 +1301,10 @@ def select_final_candidates(
             "llm_resolved": llm_resolved,
             "llm_changed_final_text": llm_changed_final_text,
             "llm_target": llm_target,
+            "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
+            "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
+            "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(deterministic_resolution["apple_nemotron_whisper_agreement_high"]),
             "review_reason": review_reason,
             "risk_flags": final_risk_flags,
             "final_risk_flags": final_risk_flags,
@@ -1257,6 +1382,10 @@ def select_final_candidates(
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
                     "llm_target": llm_target,
+                    "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
+                    "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
+                    "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
+                    "apple_nemotron_whisper_agreement_high": bool(deterministic_resolution["apple_nemotron_whisper_agreement_high"]),
                     "review_reason": review_reason,
                     "risk_flags": final_risk_flags,
                     "suggested_final_text": suggested_final_text,
@@ -1361,6 +1490,10 @@ def select_final_candidates(
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
                     "llm_target": llm_target,
+                    "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
+                    "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
+                    "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
+                    "apple_nemotron_whisper_agreement_high": bool(deterministic_resolution["apple_nemotron_whisper_agreement_high"]),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
@@ -1400,6 +1533,10 @@ def select_final_candidates(
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_target": llm_target,
+                    "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
+                    "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
+                    "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
+                    "apple_nemotron_whisper_agreement_high": bool(deterministic_resolution["apple_nemotron_whisper_agreement_high"]),
                     "llm_error": llm_decision.error if llm_decision is not None else "",
                 }
             )
