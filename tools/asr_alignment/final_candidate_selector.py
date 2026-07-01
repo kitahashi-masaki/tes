@@ -777,6 +777,16 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "llm_called": bool(block.get("llm_called", block.get("llm_used"))),
         "llm_selected": bool(block.get("llm_selected")),
         "llm_resolved": bool(block.get("llm_resolved")),
+        "llm_decision_applied": bool(block.get("llm_decision_applied")),
+        "llm_selected_source": _normalized_review_text(block.get("llm_selected_source")),
+        "llm_final_text": _normalized_review_text(block.get("llm_final_text"), final_text_display),
+        "llm_confidence": _normalized_review_text(block.get("llm_confidence")),
+        "llm_reason": _normalized_review_text(block.get("llm_reason")),
+        "llm_used_candidate_sources": list(block.get("llm_used_candidate_sources") or []),
+        "llm_final_text_accepted": bool(block.get("llm_final_text_accepted")),
+        "llm_candidate_out_of_set_violation": bool(block.get("llm_candidate_out_of_set_violation")),
+        "llm_human_review_required_recommendation": bool(block.get("llm_human_review_required_recommendation")),
+        "llm_residual_risk_flags": list(block.get("llm_residual_risk_flags") or []),
         "selected_source": _normalized_review_text(block.get("selected_source")),
         "selection_method": _normalized_review_text(block.get("selection_method")),
         "alignment_quality": _normalized_review_text(block.get("alignment_quality")),
@@ -979,6 +989,33 @@ def _llm_target_priority(reasons: list[str], segment: dict[str, Any]) -> int:
     return score
 
 
+def _llm_resolved_after_decision(
+    *,
+    llm_selected: bool,
+    llm_decision_applied: bool,
+    llm_changed_final_text: bool,
+    pre_llm_needs_review: bool,
+    review_level: str,
+    human_review_required: bool,
+    llm_human_review_required_recommendation: bool,
+    llm_candidate_out_of_set_violation: bool,
+    llm_residual_risk_flags: list[str],
+) -> bool:
+    if not llm_selected or not llm_decision_applied:
+        return False
+    if not pre_llm_needs_review:
+        return False
+    if llm_candidate_out_of_set_violation:
+        return False
+    if review_level == "human_required" or human_review_required:
+        return False
+    if llm_human_review_required_recommendation:
+        return False
+    if llm_changed_final_text:
+        return True
+    return not llm_residual_risk_flags
+
+
 def _cleanup_boundary_fragments(
     final_text: str,
     apple_text: str,
@@ -1151,12 +1188,13 @@ def select_final_candidates(
     output_dir: Path | None = None,
     conversation_punctuation: bool = False,
     short_response_period: bool = False,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     final_rows: list[dict[str, Any]] = []
     final_blocks: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
     machine_review_rows: list[dict[str, Any]] = []
     demoted_review_rows: list[dict[str, Any]] = []
+    llm_audit_rows: list[dict[str, Any]] = []
     stats = {
         "llm_used": False,
         "llm_call_count": 0,
@@ -1182,7 +1220,11 @@ def select_final_candidates(
         "trailing_boundary_suggestion_count": 0,
         "large_span_drift_warning_count": 0,
         "llm_selected_count": 0,
+        "llm_decision_applied_count": 0,
+        "llm_selected_candidate_count": 0,
         "llm_resolved_count": 0,
+        "llm_cleared_human_review_count": 0,
+        "llm_kept_human_review_count": 0,
         "llm_candidate_out_of_set_violation_count": 0,
         "llm_final_text_accepted_count": 0,
         "llm_final_text_rejected_count": 0,
@@ -1251,11 +1293,20 @@ def select_final_candidates(
         )
         llm_candidate = str(segment.get("block_id") or "") in llm_target_block_ids
         llm_selected = False
+        llm_decision_applied = False
         llm_resolved = False
         llm_changed_final_text = False
         llm_target = False
         llm_called = False
         llm_candidate_out_of_set_violation = False
+        llm_selected_source = ""
+        llm_final_text = ""
+        llm_confidence = None
+        llm_reason = ""
+        llm_used_candidate_sources: list[str] = []
+        llm_final_text_accepted = False
+        llm_human_review_required_recommendation = False
+        llm_residual_risk_flags: list[str] = []
         review_reason = list(segment.get("risk_flags") or [])
         if qwen_downgrade_reasons:
             review_reason = merge_review_reasons(review_reason, qwen_downgrade_reasons)
@@ -1296,6 +1347,10 @@ def select_final_candidates(
             if llm_decision.success:
                 stats["llm_success_count"] += 1
                 llm_source = normalize_source_choice(llm_decision.selected_source)
+                llm_selected_source = llm_source or ""
+                llm_confidence = llm_decision.confidence
+                llm_reason = str(llm_decision.notes or "")
+                llm_used_candidate_sources = [source for source in ("apple", "qwen", "nemotron", "whisper") if str(candidate_summary.get(source) or "").strip()]
                 if llm_source in candidate_rows:
                     selected_source = llm_source
                     final_text_raw = candidate_rows[llm_source].get("text", final_text_raw)
@@ -1304,6 +1359,7 @@ def select_final_candidates(
                     selection_method = "llm_candidate_selection"
                 if llm_decision.final_text:
                     llm_text = str(llm_decision.final_text).strip()
+                    llm_final_text = llm_text
                     llm_candidate_out_of_set_violation = _llm_final_text_candidate_violation(llm_text, candidate_summary, selected_source)
                     if llm_candidate_out_of_set_violation:
                         stats["llm_candidate_out_of_set_violation_count"] = stats.get("llm_candidate_out_of_set_violation_count", 0) + 1
@@ -1315,6 +1371,7 @@ def select_final_candidates(
                         llm_text = ""
                     elif llm_text:
                         stats["llm_final_text_accepted_count"] = stats.get("llm_final_text_accepted_count", 0) + 1
+                        llm_final_text_accepted = True
                     if llm_text and segment_similarity_score(llm_text, final_text) < 0.95:
                         stats["llm_changed_final_text_count"] += 1
                         llm_changed_final_text = True
@@ -1326,6 +1383,7 @@ def select_final_candidates(
                             stats["llm_final_text_rejected_count"] = stats.get("llm_final_text_rejected_count", 0) + 1
                 llm_selected = True
                 stats["llm_selected_count"] += 1
+                llm_human_review_required_recommendation = bool(llm_decision.needs_review is not False)
                 if llm_decision.needs_review is not None:
                     if llm_decision.needs_review and not pre_llm_needs_review:
                         stats["llm_changed_needs_review_true_count"] += 1
@@ -1499,9 +1557,55 @@ def select_final_candidates(
                 deterministic_resolution["deterministic_resolution_reason"],
             )
             review_reason = merge_review_reasons(review_reason, deterministic_resolution["deterministic_resolution_reason"])
-        if llm_selected and selected_source != deterministic["selected_source"]:
-            llm_resolved = True
+        llm_decision_applied = bool(
+            llm_selected
+            and (
+                llm_changed_final_text
+                or selected_source != deterministic["selected_source"]
+                or bool(llm_decision and llm_decision.needs_review is False and not human_review_required)
+            )
+        )
+        llm_residual_risk_flags = list(review_reason)
+        llm_resolved = _llm_resolved_after_decision(
+            llm_selected=llm_selected,
+            llm_decision_applied=llm_decision_applied,
+            llm_changed_final_text=llm_changed_final_text,
+            pre_llm_needs_review=pre_llm_needs_review,
+            review_level=review_level,
+            human_review_required=human_review_required,
+            llm_human_review_required_recommendation=llm_human_review_required_recommendation,
+            llm_candidate_out_of_set_violation=llm_candidate_out_of_set_violation,
+            llm_residual_risk_flags=llm_residual_risk_flags,
+        )
+        if llm_decision_applied:
+            stats["llm_decision_applied_count"] += 1
+        if llm_selected:
+            stats["llm_selected_candidate_count"] += 1
+        if llm_resolved:
+            stats["llm_cleared_human_review_count"] += 1
+        elif llm_selected:
+            stats["llm_kept_human_review_count"] += 1
+        if llm_resolved:
             stats["llm_resolved_count"] += 1
+        if llm_selected or llm_called:
+            llm_audit_rows.append(
+                {
+                    "block_id": segment["block_id"],
+                    "selected_source_before_llm": deterministic["selected_source"],
+                    "selected_source_after_llm": selected_source,
+                    "final_text_before_llm": final_text_before_cleanup,
+                    "final_text_after_llm": final_text,
+                    "llm_selected_source": llm_selected_source,
+                    "llm_final_text": llm_final_text,
+                    "llm_changed_final_text": llm_changed_final_text,
+                    "llm_resolved": llm_resolved,
+                    "review_level_before_llm": "human_required" if pre_llm_needs_review else "machine_note",
+                    "review_level_after_llm": review_level,
+                    "candidate_texts": candidate_summary,
+                    "llm_reason": llm_reason,
+                    "llm_residual_risk_flags": llm_residual_risk_flags,
+                }
+            )
         suggested_final_text, suggestion_reasons = _without_leading_fragment_suggestion(final_text, candidate_summary.get("apple", ""))
         if suggested_final_text != final_text:
             stats["suggested_final_text_count"] += 1
@@ -1583,6 +1687,15 @@ def select_final_candidates(
             "llm_resolved": llm_resolved,
             "llm_changed_final_text": llm_changed_final_text,
             "llm_target": llm_target,
+            "llm_decision_applied": llm_decision_applied,
+            "llm_selected_source": llm_selected_source,
+            "llm_final_text": llm_final_text,
+            "llm_confidence": llm_confidence,
+            "llm_reason": llm_reason,
+            "llm_used_candidate_sources": llm_used_candidate_sources,
+            "llm_final_text_accepted": llm_final_text_accepted,
+            "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
+            "llm_residual_risk_flags": llm_residual_risk_flags,
             "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
             "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
             "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
@@ -1665,6 +1778,15 @@ def select_final_candidates(
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
                     "llm_target": llm_target,
+                    "llm_decision_applied": llm_decision_applied,
+                    "llm_selected_source": llm_selected_source,
+                    "llm_final_text": llm_final_text,
+                    "llm_confidence": llm_confidence,
+                    "llm_reason": llm_reason,
+                    "llm_used_candidate_sources": llm_used_candidate_sources,
+                    "llm_final_text_accepted": llm_final_text_accepted,
+                    "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
+                    "llm_residual_risk_flags": llm_residual_risk_flags,
                     "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
                     "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
                     "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
@@ -1782,6 +1904,15 @@ def select_final_candidates(
                     "llm_resolved": llm_resolved,
                     "llm_changed_final_text": llm_changed_final_text,
                     "llm_target": llm_target,
+                    "llm_decision_applied": llm_decision_applied,
+                    "llm_selected_source": llm_selected_source,
+                    "llm_final_text": llm_final_text,
+                    "llm_confidence": llm_confidence,
+                    "llm_reason": llm_reason,
+                    "llm_used_candidate_sources": llm_used_candidate_sources,
+                    "llm_final_text_accepted": llm_final_text_accepted,
+                    "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
+                    "llm_residual_risk_flags": llm_residual_risk_flags,
                     "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
                     "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
                     "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
@@ -1830,6 +1961,16 @@ def select_final_candidates(
                     "llm_selected": llm_selected,
                     "llm_resolved": llm_resolved,
                     "llm_target": llm_target,
+                    "llm_decision_applied": llm_decision_applied,
+                    "llm_selected_source": llm_selected_source,
+                    "llm_final_text": llm_final_text,
+                    "llm_confidence": llm_confidence,
+                    "llm_reason": llm_reason,
+                    "llm_used_candidate_sources": llm_used_candidate_sources,
+                    "llm_final_text_accepted": llm_final_text_accepted,
+                    "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
+                    "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
+                    "llm_residual_risk_flags": llm_residual_risk_flags,
                     "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
                     "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
                     "apple_whisper_agreement_high": bool(deterministic_resolution["apple_whisper_agreement_high"]),
@@ -1862,6 +2003,7 @@ def select_final_candidates(
         save_jsonl(output_dir / "fusion" / f"{episode_id}.review_queue.jsonl", review_rows)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl", machine_review_rows)
         save_jsonl(output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl", demoted_review_rows)
+        save_jsonl(output_dir / "fusion" / f"{episode_id}.llm_audit.jsonl", llm_audit_rows)
         transcript_lines = [f"# {episode_id}", ""]
         for row in final_blocks:
             start = row["time"]["start_sec"]
@@ -1874,6 +2016,13 @@ def select_final_candidates(
                 f"- {row['block_id']}: {row['final_text_display']} | reasons={row.get('demote_reason', [])}"
             )
         (output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md").write_text("\n".join(demoted_lines) + "\n", encoding="utf-8")
+        llm_audit_lines = [f"# {episode_id}", "", "## llm_audit"]
+        for row in llm_audit_rows:
+            llm_audit_lines.append(
+                f"- {row['block_id']}: {row.get('selected_source_before_llm', '')} -> {row.get('selected_source_after_llm', '')} | "
+                f"changed={row.get('llm_changed_final_text', False)} resolved={row.get('llm_resolved', False)}"
+            )
+        (output_dir / "fusion" / f"{episode_id}.llm_audit.md").write_text("\n".join(llm_audit_lines) + "\n", encoding="utf-8")
         sentence_timeline_lines = []
         for row in final_rows:
             sentence_timeline_lines.append(
@@ -1897,4 +2046,4 @@ def select_final_candidates(
     stats["machine_review_note_count"] = len(machine_review_rows)
     stats["human_review_required_count"] = len(review_rows)
     stats["auto_accept_final_count"] = sum(1 for row in final_blocks if row.get("review_level") == "auto_accept")
-    return final_blocks, final_rows, review_rows, stats
+    return final_blocks, final_rows, review_rows, stats, llm_audit_rows

@@ -1003,7 +1003,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             llm_client.wait_for_ready()
             print("[pipeline] llm ready check end", flush=True)
         print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
-        final_blocks, final_rows, review_rows, llm_stats = select_final_candidates(
+        final_blocks, final_rows, review_rows, llm_stats, llm_audit_rows = select_final_candidates(
             episode_id=episode_id,
             block_rows=block_rows,
             sentence_units=sentence_units,
@@ -1088,6 +1088,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "final_transcript_md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
             "review_queue": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
             "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
+            "llm_audit": output_dir / "fusion" / f"{episode_id}.llm_audit.jsonl",
+            "llm_audit_md": output_dir / "fusion" / f"{episode_id}.llm_audit.md",
             "sentence_timeline": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
             "summary_json": output_dir / "reports" / f"{episode_id}.summary.json",
             "summary_md": output_dir / "reports" / f"{episode_id}.summary.md",
@@ -1232,7 +1234,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         print("[pipeline] llm ready check end", flush=True)
 
     print(f"[pipeline] final selection start use_llm={args.use_llm}", flush=True)
-    final_blocks, final_rows, review_rows, llm_stats = select_final_candidates(
+    final_blocks, final_rows, review_rows, llm_stats, llm_audit_rows = select_final_candidates(
         episode_id=episode_id,
         block_rows=normalized_rows,
         sentence_units=sentence_units,
@@ -1295,10 +1297,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summary["review_queue_matches_final_blocks"] = summary["review_queue_matches_human_review_required"]
     summary["sentence_timeline_row_count"] = len(final_rows)
     summary["llm_called_block_count"] = sum(1 for row in final_blocks if row.get("llm_called"))
-    summary["llm_selected_count"] = sum(1 for row in final_blocks if row.get("llm_selected"))
-    summary["llm_resolved_count"] = sum(1 for row in final_blocks if row.get("llm_resolved"))
+    summary["llm_decision_applied_count"] = sum(1 for row in final_blocks if row.get("llm_decision_applied"))
+    summary["llm_selected_candidate_count"] = sum(1 for row in final_blocks if row.get("llm_selected"))
     summary["llm_changed_final_text_count"] = sum(1 for row in final_blocks if row.get("llm_changed_final_text"))
     summary["llm_no_change_count"] = sum(1 for row in final_blocks if row.get("llm_selected") and not row.get("llm_changed_final_text"))
+    summary["llm_cleared_human_review_count"] = sum(1 for row in final_blocks if row.get("llm_resolved"))
+    summary["llm_kept_human_review_count"] = sum(1 for row in final_blocks if row.get("llm_selected") and not row.get("llm_resolved"))
+    summary["llm_resolved_count"] = summary["llm_cleared_human_review_count"]
+    summary["llm_audit_row_count"] = len(llm_audit_rows)
     summary["sentence_timeline_display_text_block_leak_count"] = sum(
         1
         for row in final_rows
@@ -1360,19 +1366,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "final_segments": output_dir / "fusion" / f"{episode_id}.final_segments.jsonl",
         "final_transcript_md": output_dir / "fusion" / f"{episode_id}.final_transcript.md",
         "review_queue": output_dir / "fusion" / f"{episode_id}.review_queue.jsonl",
+        "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
+        "llm_audit": output_dir / "fusion" / f"{episode_id}.llm_audit.jsonl",
+        "llm_audit_md": output_dir / "fusion" / f"{episode_id}.llm_audit.md",
         "sentence_timeline": output_dir / "fusion" / f"{episode_id}.sentence_timeline.jsonl",
         "summary_json": output_dir / "reports" / f"{episode_id}.summary.json",
         "summary_md": output_dir / "reports" / f"{episode_id}.summary.md",
         "normalized_summary_json": output_dir / "reports" / f"{episode_id}.normalized_summary.json",
         "normalized_summary_md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
         "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
-            "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
-            "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
-            "demoted_review_blocks": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl",
-            "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
-            "demote_debug": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl",
-            "demote_debug_md": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md",
-        }
+        "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+        "demoted_review_blocks": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl",
+        "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
+        "demote_debug": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl",
+        "demote_debug_md": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md",
+    }
     output_validation = {}
     missing_output_files: list[str] = []
     for name, path in required_outputs.items():
