@@ -97,7 +97,7 @@ def _phrase_counts(texts: list[str], phrases: tuple[str, ...]) -> dict[str, int]
 def _demote_debug_rows(final_blocks: list[dict[str, Any]], episode_id: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for block in final_blocks:
-        if not block.get("human_review_required"):
+        if not block.get("human_review_required") and not block.get("demoted_from_human_required"):
             continue
         candidate_texts = block.get("candidate_texts")
         if not isinstance(candidate_texts, dict):
@@ -136,6 +136,31 @@ def _install_timed_print() -> None:
         original_print(*args, **kwargs)
 
     builtins.print = timed_print
+
+
+def _write_demote_debug_files(output_dir: Path, episode_id: str, demote_debug_rows: list[dict[str, Any]]) -> dict[str, str]:
+    fusion_dir = output_dir / "fusion"
+    episode_no = episode_id.split("-", 1)[0]
+    primary_path = fusion_dir / f"{episode_no}.demote_debug.jsonl"
+    primary_md_path = fusion_dir / f"{episode_no}.demote_debug.md"
+    alias_path = fusion_dir / f"demote_debug_{episode_no}.jsonl"
+    alias_md_path = fusion_dir / f"demote_debug_{episode_no}.md"
+    save_jsonl(primary_path, demote_debug_rows)
+    save_jsonl(alias_path, demote_debug_rows)
+    demote_lines = [f"# {episode_id}", "", "## demote_debug"]
+    for row in demote_debug_rows:
+        demote_lines.append(
+            f"- {row['block_id']}: candidate={row['demote_candidate']} applied={row['demote_applied']} blockers={row['demote_blockers']}"
+        )
+    demote_markdown = "\n".join(demote_lines) + "\n"
+    primary_md_path.write_text(demote_markdown, encoding="utf-8")
+    alias_md_path.write_text(demote_markdown, encoding="utf-8")
+    return {
+        "demote_debug_path": str(primary_path),
+        "demote_debug_md_path": str(primary_md_path),
+        "demote_debug_alias_path": str(alias_path),
+        "demote_debug_alias_md_path": str(alias_md_path),
+    }
 
 
 def _load_alignment_result_from_files(output_dir: Path, episode_id: str, engine: str) -> AlignmentResult:
@@ -864,6 +889,10 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
     llm_changed_final_text_count = 0
     llm_no_change_count = 0
     llm_candidate_out_of_set_violation_count = 0
+    llm_final_text_accepted_count = 0
+    llm_final_text_rejected_count = 0
+    llm_merge_safety_rejected_count = 0
+    llm_merge_degraded_text_count = 0
     human_required_before_demote_count = 0
     demoted_from_human_to_machine_count = 0
     human_required_after_demote_count = 0
@@ -938,6 +967,16 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
                 llm_no_change_count += 1
             else:
                 llm_changed_final_text_count += 1
+        if block.get("llm_candidate_out_of_set_violation"):
+            llm_candidate_out_of_set_violation_count += 1
+        if block.get("llm_final_text_accepted"):
+            llm_final_text_accepted_count += 1
+        if block.get("llm_selected") and not block.get("llm_final_text_accepted") and block.get("llm_final_text"):
+            llm_final_text_rejected_count += 1
+        if block.get("llm_merge_safety_rejected"):
+            llm_merge_safety_rejected_count += 1
+        if block.get("llm_merge_degraded_text"):
+            llm_merge_degraded_text_count += 1
 
     human_review_required_count = sum(1 for row in final_blocks if row.get("human_review_required"))
     human_required_after_demote_count = human_review_required_count
@@ -982,6 +1021,10 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
         "llm_changed_final_text_count": llm_changed_final_text_count,
         "llm_no_change_count": llm_no_change_count,
         "llm_candidate_out_of_set_violation_count": llm_candidate_out_of_set_violation_count,
+        "llm_final_text_accepted_count": llm_final_text_accepted_count,
+        "llm_final_text_rejected_count": llm_final_text_rejected_count,
+        "llm_merge_safety_rejected_count": llm_merge_safety_rejected_count,
+        "llm_merge_degraded_text_count": llm_merge_degraded_text_count,
         "unusual_final_text_pattern_count": unusual_final_text_pattern_count,
         "unusual_final_text_pattern_human_required_count": unusual_final_text_pattern_human_required_count,
         "unusual_final_text_pattern_machine_note_count": unusual_final_text_pattern_machine_note_count,
@@ -1052,16 +1095,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         summary["review_sample_path"] = str(review_sample_path)
         summary["review_sample_count"] = len(review_sample_rows)
         demote_debug_rows = _demote_debug_rows(final_blocks, episode_id)
-        demote_debug_short_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl"
-        demote_debug_short_md_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md"
-        save_jsonl(demote_debug_short_path, demote_debug_rows)
-        demote_lines = [f"# {episode_id}", "", "## demote_debug"]
-        for row in demote_debug_rows:
-            demote_lines.append(
-                f"- {row['block_id']}: candidate={row['demote_candidate']} applied={row['demote_applied']} blockers={row['demote_blockers']}"
-            )
-        demote_debug_short_md_path.write_text("\n".join(demote_lines) + "\n", encoding="utf-8")
-        summary["demote_debug_path"] = str(demote_debug_short_path)
+        summary.update(_write_demote_debug_files(output_dir, episode_id, demote_debug_rows))
         summary["demote_debug_count"] = len(demote_debug_rows)
         summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
         summary["needs_review_count_normalized_blocks"] = sum(1 for row in block_rows if row.get("needs_review"))
@@ -1356,16 +1390,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summary["review_sample_path"] = str(review_sample_path)
     summary["review_sample_count"] = len(review_sample_rows)
     demote_debug_rows = _demote_debug_rows(final_blocks, episode_id)
-    demote_debug_short_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl"
-    demote_debug_short_md_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md"
-    save_jsonl(demote_debug_short_path, demote_debug_rows)
-    demote_lines = [f"# {episode_id}", "", "## demote_debug"]
-    for row in demote_debug_rows:
-        demote_lines.append(
-            f"- {row['block_id']}: candidate={row['demote_candidate']} applied={row['demote_applied']} blockers={row['demote_blockers']}"
-        )
-    demote_debug_short_md_path.write_text("\n".join(demote_lines) + "\n", encoding="utf-8")
-    summary["demote_debug_path"] = str(demote_debug_short_path)
+    summary.update(_write_demote_debug_files(output_dir, episode_id, demote_debug_rows))
     summary["demote_debug_count"] = len(demote_debug_rows)
     summary["llm_called_block_count"] = sum(1 for row in final_blocks if row.get("llm_called"))
     summary["llm_decision_applied_count"] = sum(1 for row in final_blocks if row.get("llm_decision_applied"))
@@ -1402,6 +1427,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
         "demote_debug": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl",
         "demote_debug_md": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md",
+        "demote_debug_alias": output_dir / "fusion" / f"demote_debug_{episode_id.split('-', 1)[0]}.jsonl",
+        "demote_debug_alias_md": output_dir / "fusion" / f"demote_debug_{episode_id.split('-', 1)[0]}.md",
     }
     output_validation = {}
     missing_output_files: list[str] = []

@@ -540,6 +540,102 @@ def _llm_final_text_candidate_violation(llm_text: str, candidate_texts: dict[str
     return best_similarity < 0.88
 
 
+def _candidate_contains_fragment(fragment: str, candidate_texts: dict[str, str]) -> bool:
+    normalized = _normalized_no_punct(fragment)
+    if not normalized:
+        return True
+    for candidate in candidate_texts.values():
+        candidate_text = str(candidate or "")
+        if not candidate_text:
+            continue
+        if fragment and fragment in candidate_text:
+            return True
+        if normalized in _normalized_no_punct(candidate_text):
+            return True
+    return False
+
+
+def _is_japanese_word_char(ch: str) -> bool:
+    if not ch:
+        return False
+    code = ord(ch)
+    return (
+        0x3040 <= code <= 0x309F
+        or 0x30A0 <= code <= 0x30FF
+        or 0x4E00 <= code <= 0x9FFF
+        or ch in {"ー", "々"}
+        or ch.isascii()
+        and ch.isalnum()
+    )
+
+
+def _expand_local_word(text: str, start: int, end: int, max_extra: int = 14) -> str:
+    left = start
+    left_limit = max(0, start - max_extra)
+    while left > left_limit and _is_japanese_word_char(text[left - 1]):
+        left -= 1
+    right = end
+    right_limit = min(len(text), end + max_extra)
+    while right < right_limit and _is_japanese_word_char(text[right]):
+        right += 1
+    return text[left:right].strip()
+
+
+def _looks_like_stem_suffix_splice(changed_chunk: str, local_word: str, candidate_texts: dict[str, str]) -> bool:
+    chunk = _normalized_no_punct(changed_chunk)
+    word = _normalized_no_punct(local_word)
+    if not chunk or not word:
+        return False
+    if _candidate_contains_fragment(local_word, candidate_texts):
+        return False
+    risky_negative_join = any(pattern in word for pattern in ("るじゃない", "るじゃな", "ますじゃない", "りますじゃない"))
+    verb_tail_join = chunk[0] in set("るくぐすつづぬぶむ") and "じゃな" in chunk
+    return risky_negative_join or verb_tail_join
+
+
+def _llm_merge_safety_check(
+    before_text: str,
+    merged_text: str,
+    candidate_texts: dict[str, str],
+    selected_source: str,
+) -> dict[str, Any]:
+    before = str(before_text or "").strip()
+    after = str(merged_text or "").strip()
+    reasons: list[str] = []
+    degraded = False
+    if not after:
+        return {"accepted": False, "reasons": ["empty_merged_text"], "degraded": False}
+    if _normalized_no_punct(before) == _normalized_no_punct(after):
+        return {"accepted": True, "reasons": [], "degraded": False}
+    if _llm_final_text_candidate_violation(after, candidate_texts, selected_source):
+        return {"accepted": False, "reasons": ["llm_candidate_out_of_set_violation"], "degraded": False}
+
+    candidate_values = [str(value or "") for value in candidate_texts.values() if str(value or "").strip()]
+    if candidate_values and any(_normalized_no_punct(after) == _normalized_no_punct(candidate) for candidate in candidate_values):
+        return {"accepted": True, "reasons": [], "degraded": False}
+
+    before_best = max((segment_similarity_score(before, candidate) for candidate in candidate_values), default=0.0)
+    after_best = max((segment_similarity_score(after, candidate) for candidate in candidate_values), default=0.0)
+    if after_best + 0.025 < before_best:
+        reasons.append("merged_text_degraded")
+        degraded = True
+
+    matcher = difflib.SequenceMatcher(None, before, after)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal" or tag == "delete":
+            continue
+        changed_chunk = after[j1:j2].strip()
+        if len(_normalized_no_punct(changed_chunk)) < 2:
+            continue
+        local_word = _expand_local_word(after, j1, j2)
+        if not _candidate_contains_fragment(changed_chunk, candidate_texts):
+            reasons.append("merged_span_not_in_candidates")
+        if _looks_like_stem_suffix_splice(changed_chunk, local_word, candidate_texts):
+            reasons.append("merged_stem_suffix_splice")
+
+    return {"accepted": not reasons, "reasons": list(dict.fromkeys(reasons)), "degraded": degraded}
+
+
 def _llm_merge_spans(final_text: str, candidate_texts: dict[str, str], selected_source: str) -> list[dict[str, str]]:
     text = str(final_text or "").strip()
     if not text:
@@ -862,6 +958,7 @@ def _machine_note_demotion_debug(
         candidate_texts=candidate_texts,
         deterministic_resolution=deterministic_resolution,
     )
+    demote_applied = bool(demote_applied or block.get("demoted_from_human_required"))
     demote_blockers: list[str] = []
     if selected_source != "apple":
         demote_blockers.append("selected_source_not_apple")
@@ -877,6 +974,10 @@ def _machine_note_demotion_debug(
         demote_blockers.append("genuine_unusual_final_text_pattern_present")
     if genuine_unusual_final_text_pattern:
         demote_blockers.append("final_text_suspicious")
+    if not apple_whisper_agreement_high:
+        demote_blockers.append("apple_whisper_agreement_low")
+    if not apple_nemotron_whisper_agreement_high:
+        demote_blockers.append("apple_nemotron_whisper_agreement_low")
     if not deterministic_resolution_available:
         demote_blockers.append("deterministic_resolution_unavailable")
     if not demote_applied:
@@ -906,6 +1007,8 @@ def _machine_note_demotion_debug(
     demote_candidate = selected_source == "apple" and boundary_contamination_suspected and not any(
         flag in flags for flag in {"critical_term_disagreement", "numeric_disagreement", "domain_error_phrase", "genuine_unusual_final_text_pattern"}
     )
+    if demote_applied:
+        demote_blockers = []
     return {
         "episode_id": episode_id,
         "block_id": block.get("block_id", ""),
@@ -982,6 +1085,9 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "llm_final_text_accepted": bool(block.get("llm_final_text_accepted")),
         "llm_merged_candidate": bool(block.get("llm_merged_candidate")),
         "llm_merge_spans": list(block.get("llm_merge_spans") or []),
+        "llm_merge_safety_rejected": bool(block.get("llm_merge_safety_rejected")),
+        "llm_merge_safety_reject_reason": list(block.get("llm_merge_safety_reject_reason") or []),
+        "llm_merge_degraded_text": bool(block.get("llm_merge_degraded_text")),
         "llm_candidate_out_of_set_violation": bool(block.get("llm_candidate_out_of_set_violation")),
         "llm_human_review_required_recommendation": bool(block.get("llm_human_review_required_recommendation")),
         "raw_llm_human_review_required_recommendation": bool(block.get("raw_llm_human_review_required_recommendation")),
@@ -1436,6 +1542,8 @@ def select_final_candidates(
         "llm_candidate_out_of_set_violation_count": 0,
         "llm_final_text_accepted_count": 0,
         "llm_final_text_rejected_count": 0,
+        "llm_merge_safety_rejected_count": 0,
+        "llm_merge_degraded_text_count": 0,
         "review_level_counts": {"auto_accept": 0, "machine_note": 0, "human_required": 0},
     }
     previous_end: float | None = None
@@ -1485,6 +1593,11 @@ def select_final_candidates(
         if qwen_downgrade_reasons:
             final_text = final_text_raw
             selection_method = "deterministic_qwen_downgraded"
+        pre_llm_selected_source = selected_source
+        pre_llm_final_text_raw = final_text_raw
+        pre_llm_final_text = final_text
+        pre_llm_selection_method = selection_method
+        pre_llm_confidence = confidence
         pre_llm_needs_review = bool(segment.get("needs_review"))
         normalized_needs_review = bool(segment.get("needs_review"))
         candidate_summary = {source: row.get("text", "") for source, row in candidate_rows.items()}
@@ -1520,6 +1633,9 @@ def select_final_candidates(
         llm_residual_risk_flags: list[str] = []
         llm_merge_spans: list[dict[str, str]] = []
         llm_merged_candidate = False
+        llm_merge_safety_rejected = False
+        llm_merge_safety_reject_reason: list[str] = []
+        llm_merge_degraded_text = False
         llm_timeout_fallback_applied = False
         review_reason = list(segment.get("risk_flags") or [])
         if qwen_downgrade_reasons:
@@ -1575,12 +1691,35 @@ def select_final_candidates(
                     llm_text = str(llm_decision.final_text).strip()
                     llm_final_text = llm_text
                     llm_candidate_out_of_set_violation = _llm_final_text_candidate_violation(llm_text, candidate_summary, selected_source)
+                    merge_safety = {"accepted": True, "reasons": [], "degraded": False}
+                    if not llm_candidate_out_of_set_violation:
+                        merge_safety = _llm_merge_safety_check(final_text, llm_text, candidate_summary, selected_source)
+                        if not merge_safety["accepted"]:
+                            llm_candidate_out_of_set_violation = True
+                            llm_merge_safety_rejected = True
+                            llm_merge_safety_reject_reason = list(merge_safety["reasons"])
+                            llm_merge_degraded_text = bool(merge_safety.get("degraded"))
                     if llm_candidate_out_of_set_violation:
                         stats["llm_candidate_out_of_set_violation_count"] = stats.get("llm_candidate_out_of_set_violation_count", 0) + 1
+                        if llm_merge_safety_rejected:
+                            stats["llm_merge_safety_rejected_count"] = stats.get("llm_merge_safety_rejected_count", 0) + 1
+                        if llm_merge_degraded_text:
+                            stats["llm_merge_degraded_text_count"] = stats.get("llm_merge_degraded_text_count", 0) + 1
+                        selected_source = pre_llm_selected_source
+                        final_text_raw = pre_llm_final_text_raw
+                        final_text = pre_llm_final_text
+                        selection_method = pre_llm_selection_method
+                        confidence = pre_llm_confidence
+                        llm_final_text_accepted = False
+                        llm_changed_final_text = False
                         llm_decision = dataclasses.replace(
                             llm_decision,
                             needs_review=True,
-                            review_reason=merge_review_reasons(_normalize_review_reason(llm_decision.review_reason), ["llm_candidate_out_of_set_violation"]),
+                            review_reason=merge_review_reasons(
+                                _normalize_review_reason(llm_decision.review_reason),
+                                ["llm_candidate_out_of_set_violation"],
+                                llm_merge_safety_reject_reason,
+                            ),
                         )
                         llm_text = ""
                     elif llm_text:
@@ -1598,15 +1737,41 @@ def select_final_candidates(
                 if not llm_candidate_out_of_set_violation:
                     merged_text, merged_spans = _safe_candidate_merge(final_text, candidate_summary, selected_source)
                     if merged_spans and merged_text != final_text:
-                        llm_merged_candidate = True
-                        llm_merge_spans = _llm_merge_spans(merged_text, candidate_summary, selected_source) or merged_spans
-                        final_text_raw = merged_text
-                        final_text = merged_text
-                        llm_final_text = merged_text
-                        selected_source = "merged_candidates"
-                        selection_method = "llm_candidate_merge"
-                        llm_changed_final_text = True
-                        llm_decision_applied = True
+                        merge_safety = _llm_merge_safety_check(final_text, merged_text, candidate_summary, selected_source)
+                        if merge_safety["accepted"]:
+                            llm_merged_candidate = True
+                            llm_merge_spans = _llm_merge_spans(merged_text, candidate_summary, selected_source) or merged_spans
+                            final_text_raw = merged_text
+                            final_text = merged_text
+                            llm_final_text = merged_text
+                            selected_source = "merged_candidates"
+                            selection_method = "llm_candidate_merge"
+                            llm_changed_final_text = True
+                            llm_decision_applied = True
+                        else:
+                            llm_candidate_out_of_set_violation = True
+                            llm_merge_safety_rejected = True
+                            llm_merge_safety_reject_reason = list(merge_safety["reasons"])
+                            llm_merge_degraded_text = bool(merge_safety.get("degraded"))
+                            llm_final_text = merged_text
+                            llm_final_text_accepted = False
+                            llm_changed_final_text = False
+                            llm_merged_candidate = False
+                            selected_source = pre_llm_selected_source
+                            final_text_raw = pre_llm_final_text_raw
+                            final_text = pre_llm_final_text
+                            selection_method = pre_llm_selection_method
+                            confidence = pre_llm_confidence
+                            stats["llm_candidate_out_of_set_violation_count"] = stats.get("llm_candidate_out_of_set_violation_count", 0) + 1
+                            stats["llm_final_text_rejected_count"] = stats.get("llm_final_text_rejected_count", 0) + 1
+                            stats["llm_merge_safety_rejected_count"] = stats.get("llm_merge_safety_rejected_count", 0) + 1
+                            if llm_merge_degraded_text:
+                                stats["llm_merge_degraded_text_count"] = stats.get("llm_merge_degraded_text_count", 0) + 1
+                            review_reason = merge_review_reasons(
+                                review_reason,
+                                ["llm_candidate_out_of_set_violation"],
+                                llm_merge_safety_reject_reason,
+                            )
                 llm_selected = True
                 stats["llm_selected_count"] += 1
                 raw_llm_human_review_required_recommendation = bool(llm_decision.needs_review is not False)
@@ -1747,6 +1912,8 @@ def select_final_candidates(
                 final_risk_flags.append("boundary_contamination_suspected")
         if cleanup_needs_review and "boundary_cleanup_needed" not in final_risk_flags:
             final_risk_flags.append("boundary_cleanup_needed")
+        if llm_candidate_out_of_set_violation and "llm_candidate_out_of_set_violation" not in final_risk_flags:
+            final_risk_flags.append("llm_candidate_out_of_set_violation")
         review_classification = _classify_review_level(
             segment,
             final_risk_flags,
@@ -1813,8 +1980,18 @@ def select_final_candidates(
                 deterministic_resolution["deterministic_resolution_reason"],
             )
             review_reason = merge_review_reasons(review_reason, deterministic_resolution["deterministic_resolution_reason"])
+        if llm_candidate_out_of_set_violation:
+            human_review_required = True
+            machine_review_note = False
+            review_level = "human_required"
+            review_priority = "high"
+            review_gate_reasons = merge_review_reasons(review_gate_reasons, ["llm_candidate_out_of_set_violation"], llm_merge_safety_reject_reason)
+            machine_note_reasons = []
+            review_reason = merge_review_reasons(review_reason, ["llm_candidate_out_of_set_violation"], llm_merge_safety_reject_reason)
+            llm_target = False
         llm_decision_applied = bool(
             llm_selected
+            and not llm_candidate_out_of_set_violation
             and (
                 llm_changed_final_text
                 or llm_merged_candidate
@@ -1864,6 +2041,9 @@ def select_final_candidates(
                     "llm_resolved": llm_resolved,
                     "llm_merged_candidate": llm_merged_candidate,
                     "llm_merge_spans": llm_merge_spans,
+                    "llm_merge_safety_rejected": llm_merge_safety_rejected,
+                    "llm_merge_safety_reject_reason": llm_merge_safety_reject_reason,
+                    "llm_merge_degraded_text": llm_merge_degraded_text,
                     "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
                     "llm_used_candidate_sources": llm_used_candidate_sources,
                     "llm_confidence": llm_confidence,
@@ -1970,6 +2150,9 @@ def select_final_candidates(
             "llm_final_text_accepted": llm_final_text_accepted,
             "llm_merged_candidate": llm_merged_candidate,
             "llm_merge_spans": llm_merge_spans,
+            "llm_merge_safety_rejected": llm_merge_safety_rejected,
+            "llm_merge_safety_reject_reason": llm_merge_safety_reject_reason,
+            "llm_merge_degraded_text": llm_merge_degraded_text,
             "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
             "raw_llm_human_review_required_recommendation": raw_llm_human_review_required_recommendation,
             "final_human_review_required_after_safety_gate": final_human_review_required_after_safety_gate,
@@ -2064,6 +2247,9 @@ def select_final_candidates(
                     "llm_reason": llm_reason,
                     "llm_used_candidate_sources": llm_used_candidate_sources,
                     "llm_final_text_accepted": llm_final_text_accepted,
+                    "llm_merge_safety_rejected": llm_merge_safety_rejected,
+                    "llm_merge_safety_reject_reason": llm_merge_safety_reject_reason,
+                    "llm_merge_degraded_text": llm_merge_degraded_text,
                     "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
                     "llm_residual_risk_flags": llm_residual_risk_flags,
                     "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
