@@ -615,6 +615,7 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- human_required_after_demote_count: {summary.get('human_required_after_demote_count', 0)}")
     lines.append(f"- demote_reason_counts: {summary.get('demote_reason_counts', {})}")
     lines.append(f"- recommended_next_action_counts: {summary.get('recommended_next_action_counts', {})}")
+    lines.append(f"- recommended_next_action_missing_count: {summary.get('recommended_next_action_missing_count', 0)}")
     lines.append(f"- review_sample_level_counts: {summary.get('review_sample_level_counts', {})}")
     lines.append(f"- qwen_alignment_low_by_selected_source: {summary.get('qwen_alignment_low_by_selected_source', {})}")
     lines.append(f"- qwen_alignment_low_human_required_by_selected_source: {summary.get('qwen_alignment_low_human_required_by_selected_source', {})}")
@@ -828,6 +829,7 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
     human_required_after_demote_count = 0
     demote_reason_counts = Counter()
     recommended_next_action_counts = Counter()
+    recommended_next_action_missing_count = 0
 
     def _target_reasons(block: dict[str, Any]) -> list[str]:
         flags = set(str(flag) for flag in (block.get("final_risk_flags") or block.get("risk_flags") or []))
@@ -857,7 +859,11 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
 
     for block in final_blocks:
         selected_source = str(block.get("selected_source") or "unknown")
-        recommended_next_action_counts[str(block.get("recommended_next_action") or "auto_accept")] += 1
+        recommended_next_action = block.get("recommended_next_action")
+        if recommended_next_action:
+            recommended_next_action_counts[str(recommended_next_action)] += 1
+        else:
+            recommended_next_action_missing_count += 1
         if block.get("demoted_from_human_required"):
             demoted_from_human_to_machine_count += 1
             for reason in block.get("demote_reason") or []:
@@ -917,6 +923,7 @@ def _review_summary_metrics(final_blocks: list[dict[str, Any]], review_rows: lis
         "human_required_after_demote_count": human_required_after_demote_count,
         "demote_reason_counts": dict(demote_reason_counts),
         "recommended_next_action_counts": dict(recommended_next_action_counts),
+        "recommended_next_action_missing_count": recommended_next_action_missing_count,
         "review_queue_matches_human_review_required": human_review_required_count == review_queue_row_count,
         "review_queue_matches_final_blocks": human_review_required_count == review_queue_row_count,
         "review_sample_count": len(review_sample_rows),

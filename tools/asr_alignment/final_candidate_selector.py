@@ -1417,6 +1417,13 @@ def select_final_candidates(
         else:
             review_reason = []
         needs_review = human_review_required
+        recommended_next_action = _recommended_next_action(
+            {
+                "llm_target": llm_target,
+                "deterministic_resolution_available": deterministic_resolution["deterministic_resolution_available"],
+                "review_level": review_level,
+            }
+        )
         stats["review_level_counts"][review_level] += 1
         segment_time = dict(segment["time"])
         segment_time["start_sec"], segment_time["end_sec"] = _maybe_clamp_time(
@@ -1450,6 +1457,7 @@ def select_final_candidates(
             "machine_review_note": machine_review_note,
             "review_level": review_level,
             "review_priority": review_priority,
+            "recommended_next_action": recommended_next_action,
             "review_gate_reasons": review_gate_reasons,
             "machine_note_reasons": machine_note_reasons,
             "human_review_reason": human_review_reason,
@@ -1533,6 +1541,7 @@ def select_final_candidates(
                     "machine_review_note": machine_review_note,
                     "review_level": review_level,
                     "review_priority": review_priority,
+                    "recommended_next_action": recommended_next_action,
                     "review_gate_reasons": review_gate_reasons,
                     "machine_note_reasons": machine_note_reasons,
                     "human_review_reason": human_review_reason,
@@ -1592,6 +1601,7 @@ def select_final_candidates(
                     "machine_review_note": machine_review_note,
                     "review_level": review_level,
                     "review_priority": review_priority,
+                    "recommended_next_action": recommended_next_action,
                     "review_reason": review_reason,
                     "alignment_quality": segment.get("alignment_quality"),
                     "risk_flags": list(segment.get("risk_flags", []) or []),
@@ -1669,6 +1679,7 @@ def select_final_candidates(
                     "segment_id": segment.get("segment_id"),
                     "review_level": review_level,
                     "review_priority": review_priority,
+                    "recommended_next_action": recommended_next_action,
                     "machine_review_note": machine_review_note,
                     "machine_note_reasons": machine_note_reasons,
                     "review_gate_reasons": review_gate_reasons,
