@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import re
 import sys
@@ -436,11 +437,34 @@ def _has_unusual_final_text_pattern(text: str) -> bool:
     return _unusual_final_text_pattern_level(text) is not None
 
 
+def _final_text_suspicious_level(text: str) -> str | None:
+    return _unusual_final_text_pattern_level(text)
+
+
+def _final_text_suspicious_details(text: str) -> dict[str, Any]:
+    patterns = _find_unusual_final_text_patterns(text)
+    hard = [pattern for pattern in patterns if pattern.get("severity") == "human_required"]
+    soft = [pattern for pattern in patterns if pattern.get("severity") == "machine_note"]
+    level = "none"
+    if hard:
+        level = "human_required"
+    elif soft:
+        level = "machine_note"
+    return {
+        "final_text_suspicious": level != "none",
+        "final_text_suspicious_level": level,
+        "final_text_suspicious_reasons": [str(pattern.get("pattern_id") or "") for pattern in patterns],
+        "final_text_suspicious_hard_reasons": [str(pattern.get("pattern_id") or "") for pattern in hard],
+        "final_text_suspicious_soft_reasons": [str(pattern.get("pattern_id") or "") for pattern in soft],
+        "unusual_final_text_patterns": patterns,
+    }
+
+
 def _final_text_suspicious(text: str) -> bool:
     value = str(text or "").strip()
     if not value:
         return True
-    return _unusual_final_text_pattern_level(value) is not None
+    return _final_text_suspicious_level(value) is not None
 
 
 def _final_text_natural(text: str, candidate_texts: dict[str, str]) -> bool:
@@ -468,6 +492,10 @@ def _llm_final_text_candidate_violation(llm_text: str, candidate_texts: dict[str
     text = str(llm_text or "").strip()
     if not text:
         return True
+    if selected_source == "merged_candidates":
+        selected_texts = [str(v or "") for v in candidate_texts.values() if str(v or "").strip()]
+        if selected_texts and any(segment_similarity_score(text, candidate) >= 0.88 for candidate in selected_texts):
+            return False
     selected_text = str(candidate_texts.get(selected_source) or "") if selected_source else ""
     if selected_text and _normalized_no_punct(text) == _normalized_no_punct(selected_text):
         return False
@@ -484,6 +512,139 @@ def _llm_final_text_candidate_violation(llm_text: str, candidate_texts: dict[str
         if candidate:
             best_similarity = max(best_similarity, segment_similarity_score(text, candidate))
     return best_similarity < 0.88
+
+
+def _llm_merge_spans(final_text: str, candidate_texts: dict[str, str], selected_source: str) -> list[dict[str, str]]:
+    text = str(final_text or "").strip()
+    if not text:
+        return []
+    selected_text = str(candidate_texts.get(selected_source) or "") if selected_source else ""
+    spans: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for source in ("apple", "qwen", "nemotron", "whisper"):
+        candidate = str(candidate_texts.get(source) or "").strip()
+        if not candidate or candidate == selected_text:
+            continue
+        matcher = difflib.SequenceMatcher(None, text, candidate)
+        blocks = []
+        for block in matcher.get_matching_blocks():
+            if block.size < 3:
+                continue
+            chunk = text[block.a : block.a + block.size].strip()
+            if len(chunk) < 2:
+                continue
+            if selected_text and chunk in selected_text:
+                continue
+            blocks.append((len(chunk), chunk))
+        blocks.sort(reverse=True)
+        for _, chunk in blocks[:2]:
+            key = (chunk, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            spans.append({"text": chunk, "source": source})
+    return spans
+
+
+def _is_kana_or_kana_punct(ch: str) -> bool:
+    if not ch:
+        return False
+    code = ord(ch)
+    return (
+        0x3040 <= code <= 0x309F
+        or 0x30A0 <= code <= 0x30FF
+        or ch in {"ー", "・", "、", "。", "！", "？", " ", "\u3000"}
+    )
+
+
+def _safe_candidate_merge(base_text: str, candidate_texts: dict[str, str], selected_source: str) -> tuple[str, list[dict[str, str]]]:
+    text = str(base_text or "").strip()
+    if not text:
+        return text, []
+    merged_text = text
+    merge_spans: list[dict[str, str]] = []
+    selected_text = str(candidate_texts.get(selected_source) or "") if selected_source else ""
+
+    def _safe_chunk(chunk: str, source: str, all_chunks: dict[str, list[str]]) -> bool:
+        normalized = chunk.strip()
+        if not normalized:
+            return False
+        if len(normalized) <= 8 and all(_is_kana_or_kana_punct(ch) for ch in normalized):
+            return True
+        if normalized in selected_text:
+            return False
+        supporting_sources = [src for src, chunks in all_chunks.items() if normalized in chunks]
+        return len(supporting_sources) >= 2 and source in supporting_sources
+
+    chunk_support: dict[str, list[str]] = {}
+    for source in ("apple", "qwen", "nemotron", "whisper"):
+        candidate = str(candidate_texts.get(source) or "").strip()
+        if not candidate or source == selected_source:
+            continue
+        sm = difflib.SequenceMatcher(None, merged_text, candidate)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            candidate_chunk = candidate[j1:j2].strip()
+            if len(candidate_chunk) < 2:
+                continue
+            chunk_support.setdefault(candidate_chunk, []).append(source)
+
+    for source in ("apple", "qwen", "nemotron", "whisper"):
+        if source == selected_source:
+            continue
+        candidate = str(candidate_texts.get(source) or "").strip()
+        if not candidate:
+            continue
+        sm = difflib.SequenceMatcher(None, merged_text, candidate)
+        strong_chunks: list[str] = []
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            candidate_chunk = candidate[j1:j2].strip()
+            if len(candidate_chunk) >= 2 and len(candidate_chunk) <= 12:
+                strong_chunks.append(candidate_chunk)
+        for start in range(0, len(candidate)):
+            for size in range(3, min(9, len(candidate) - start) + 1):
+                chunk = candidate[start : start + size].strip()
+                if not chunk:
+                    continue
+                if chunk in merged_text:
+                    continue
+                if not all(_is_kana_or_kana_punct(ch) for ch in chunk):
+                    continue
+                strong_chunks.append(chunk)
+        strong_chunks = sorted(dict.fromkeys(strong_chunks), key=len, reverse=True)
+        replacement_applied = False
+        for chunk in strong_chunks:
+            if replacement_applied:
+                break
+            if not _safe_chunk(chunk, source, chunk_support):
+                continue
+            best_window: tuple[int, int, float] | None = None
+            for length in range(max(2, len(chunk) - 2), min(len(merged_text), len(chunk) + 2) + 1):
+                for start in range(0, len(merged_text) - length + 1):
+                    window = merged_text[start : start + length]
+                    ratio = difflib.SequenceMatcher(None, window, chunk).ratio()
+                    if ratio < 0.55:
+                        continue
+                    if best_window is None or ratio > best_window[2]:
+                        best_window = (start, length, ratio)
+            if best_window is None:
+                continue
+            start, length, _ = best_window
+            new_text = merged_text[:start] + chunk + merged_text[start + length :]
+            if _llm_final_text_candidate_violation(new_text, candidate_texts, selected_source):
+                continue
+            merged_text = new_text
+            merge_spans.append({"text": chunk, "source": source})
+            replacement_applied = True
+        if replacement_applied:
+            break
+
+    if not merge_spans or merged_text == text:
+        return text, []
+    return merged_text, merge_spans
 
 
 def _normalized_review_text(value: Any, fallback: str = "") -> str:
@@ -558,7 +719,7 @@ def _deterministic_resolution_decision(block: dict[str, Any], candidate_texts: d
             "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
             "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
         }
-    if not any(flag in remaining_flags for flag in severe_flags) and not _has_unusual_final_text_pattern(final_text_display):
+    if not any(flag in remaining_flags for flag in severe_flags) and _final_text_suspicious_level(final_text_display) != "human_required":
         return {
             "deterministic_resolution_available": True,
             "deterministic_resolution_reason": [
@@ -623,7 +784,7 @@ def _machine_note_demotion_decision(
     reasons = list(deterministic_resolution.get("deterministic_resolution_reason") or [])
     if "boundary_contamination_only" not in reasons:
         return False, []
-    if _final_text_suspicious(final_text):
+    if _final_text_suspicious_level(final_text) == "human_required":
         return False, []
     if not _final_text_natural(final_text, candidate_texts):
         return False, []
@@ -658,9 +819,13 @@ def _machine_note_demotion_debug(
     critical_term_disagreement = "critical_term_disagreement" in flags
     numeric_disagreement = "numeric_disagreement" in flags
     domain_error_phrase = "domain_error_phrase" in flags
-    unusual_level = _unusual_final_text_pattern_level(final_text)
+    suspicious_details = _final_text_suspicious_details(final_text)
+    unusual_level = str(suspicious_details.get("final_text_suspicious_level") or "none")
     genuine_unusual_final_text_pattern = unusual_level == "human_required"
-    final_text_suspicious = _final_text_suspicious(final_text)
+    final_text_suspicious = bool(suspicious_details.get("final_text_suspicious"))
+    final_text_suspicious_reasons = list(suspicious_details.get("final_text_suspicious_reasons") or [])
+    final_text_suspicious_hard_reasons = list(suspicious_details.get("final_text_suspicious_hard_reasons") or [])
+    final_text_suspicious_soft_reasons = list(suspicious_details.get("final_text_suspicious_soft_reasons") or [])
     apple_whisper_agreement_high = bool(deterministic_resolution.get("apple_whisper_agreement_high"))
     apple_nemotron_whisper_agreement_high = bool(deterministic_resolution.get("apple_nemotron_whisper_agreement_high"))
     deterministic_resolution_available = bool(deterministic_resolution.get("deterministic_resolution_available"))
@@ -684,7 +849,7 @@ def _machine_note_demotion_debug(
         demote_blockers.append("domain_error_phrase_present")
     if genuine_unusual_final_text_pattern:
         demote_blockers.append("genuine_unusual_final_text_pattern_present")
-    if final_text_suspicious:
+    if genuine_unusual_final_text_pattern:
         demote_blockers.append("final_text_suspicious")
     if not deterministic_resolution_available:
         demote_blockers.append("deterministic_resolution_unavailable")
@@ -710,7 +875,7 @@ def _machine_note_demotion_debug(
         and not numeric_disagreement
         and not domain_error_phrase
         and not genuine_unusual_final_text_pattern
-        and not final_text_suspicious
+        and unusual_level != "human_required"
     )
     demote_candidate = selected_source == "apple" and boundary_contamination_suspected and not any(
         flag in flags for flag in {"critical_term_disagreement", "numeric_disagreement", "domain_error_phrase", "genuine_unusual_final_text_pattern"}
@@ -736,6 +901,10 @@ def _machine_note_demotion_debug(
         "apple_whisper_agreement_high": apple_whisper_agreement_high,
         "apple_nemotron_whisper_agreement_high": apple_nemotron_whisper_agreement_high,
         "final_text_suspicious": final_text_suspicious,
+        "final_text_suspicious_level": unusual_level,
+        "final_text_suspicious_reasons": final_text_suspicious_reasons,
+        "final_text_suspicious_hard_reasons": final_text_suspicious_hard_reasons,
+        "final_text_suspicious_soft_reasons": final_text_suspicious_soft_reasons,
         "deterministic_resolution_available": deterministic_resolution_available,
         "deterministic_resolution_reason": list(deterministic_resolution.get("deterministic_resolution_reason") or []),
     }
@@ -751,6 +920,7 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
     candidate_texts = _candidate_texts_for_block(block)
     final_risk_flags = list(block.get("final_risk_flags") or block.get("risk_flags") or [])
     unusual_patterns = _find_unusual_final_text_patterns(final_text_display)
+    suspicious_details = _final_text_suspicious_details(final_text_display)
     row = {
         "episode_id": block.get("episode_id", ""),
         "block_id": block.get("block_id", ""),
@@ -784,8 +954,13 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "llm_reason": _normalized_review_text(block.get("llm_reason")),
         "llm_used_candidate_sources": list(block.get("llm_used_candidate_sources") or []),
         "llm_final_text_accepted": bool(block.get("llm_final_text_accepted")),
+        "llm_merged_candidate": bool(block.get("llm_merged_candidate")),
+        "llm_merge_spans": list(block.get("llm_merge_spans") or []),
         "llm_candidate_out_of_set_violation": bool(block.get("llm_candidate_out_of_set_violation")),
         "llm_human_review_required_recommendation": bool(block.get("llm_human_review_required_recommendation")),
+        "raw_llm_human_review_required_recommendation": bool(block.get("raw_llm_human_review_required_recommendation")),
+        "final_human_review_required_after_safety_gate": bool(block.get("final_human_review_required_after_safety_gate")),
+        "safety_gate_reasons": list(block.get("safety_gate_reasons") or []),
         "llm_residual_risk_flags": list(block.get("llm_residual_risk_flags") or []),
         "selected_source": _normalized_review_text(block.get("selected_source")),
         "selection_method": _normalized_review_text(block.get("selection_method")),
@@ -794,8 +969,11 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "qwen_apple_similarity": float(block.get("qwen_apple_similarity") if block.get("qwen_apple_similarity") is not None else 0.0),
         "final_text_raw": final_text,
         "final_text_display": final_text_display,
-        "final_text_suspicious": _final_text_suspicious(final_text_display),
-        "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_patterns],
+        "final_text_suspicious": bool(suspicious_details["final_text_suspicious"]),
+        "final_text_suspicious_level": suspicious_details["final_text_suspicious_level"],
+        "final_text_suspicious_reasons": list(suspicious_details["final_text_suspicious_reasons"]),
+        "final_text_suspicious_hard_reasons": list(suspicious_details["final_text_suspicious_hard_reasons"]),
+        "final_text_suspicious_soft_reasons": list(suspicious_details["final_text_suspicious_soft_reasons"]),
         "apple_text": apple_text,
         "qwen_text": qwen_text,
         "nemotron_text": nemotron_text,
@@ -1222,6 +1400,7 @@ def select_final_candidates(
         "llm_selected_count": 0,
         "llm_decision_applied_count": 0,
         "llm_selected_candidate_count": 0,
+        "llm_merged_candidate_count": 0,
         "llm_resolved_count": 0,
         "llm_cleared_human_review_count": 0,
         "llm_kept_human_review_count": 0,
@@ -1306,7 +1485,12 @@ def select_final_candidates(
         llm_used_candidate_sources: list[str] = []
         llm_final_text_accepted = False
         llm_human_review_required_recommendation = False
+        raw_llm_human_review_required_recommendation = False
+        final_human_review_required_after_safety_gate = False
+        safety_gate_reasons: list[str] = []
         llm_residual_risk_flags: list[str] = []
+        llm_merge_spans: list[dict[str, str]] = []
+        llm_merged_candidate = False
         review_reason = list(segment.get("risk_flags") or [])
         if qwen_downgrade_reasons:
             review_reason = merge_review_reasons(review_reason, qwen_downgrade_reasons)
@@ -1381,9 +1565,22 @@ def select_final_candidates(
                     else:
                         if llm_candidate_out_of_set_violation:
                             stats["llm_final_text_rejected_count"] = stats.get("llm_final_text_rejected_count", 0) + 1
+                if not llm_candidate_out_of_set_violation:
+                    merged_text, merged_spans = _safe_candidate_merge(final_text, candidate_summary, selected_source)
+                    if merged_spans and merged_text != final_text:
+                        llm_merged_candidate = True
+                        llm_merge_spans = _llm_merge_spans(merged_text, candidate_summary, selected_source) or merged_spans
+                        final_text_raw = merged_text
+                        final_text = merged_text
+                        llm_final_text = merged_text
+                        selected_source = "merged_candidates"
+                        selection_method = "llm_candidate_merge"
+                        llm_changed_final_text = True
+                        llm_decision_applied = True
                 llm_selected = True
                 stats["llm_selected_count"] += 1
-                llm_human_review_required_recommendation = bool(llm_decision.needs_review is not False)
+                raw_llm_human_review_required_recommendation = bool(llm_decision.needs_review is not False)
+                llm_human_review_required_recommendation = raw_llm_human_review_required_recommendation
                 if llm_decision.needs_review is not None:
                     if llm_decision.needs_review and not pre_llm_needs_review:
                         stats["llm_changed_needs_review_true_count"] += 1
@@ -1453,7 +1650,8 @@ def select_final_candidates(
             candidate_text_similarity = max(segment_similarity_score(final_text, candidate_text) for candidate_text in candidate_texts_for_mix)
         if llm_selected and llm_decision is not None and llm_decision.final_text and candidate_text_similarity < 0.92:
             final_risk_flags.append("llm_candidate_mix_suspected")
-        unusual_final_text_patterns = _find_unusual_final_text_patterns(final_text)
+        suspicious_details = _final_text_suspicious_details(final_text)
+        unusual_final_text_patterns = list(suspicious_details.get("unusual_final_text_patterns") or [])
         if unusual_final_text_patterns and "unusual_final_text_pattern" not in final_risk_flags:
             final_risk_flags.append("unusual_final_text_pattern")
 
@@ -1561,11 +1759,15 @@ def select_final_candidates(
             llm_selected
             and (
                 llm_changed_final_text
+                or llm_merged_candidate
                 or selected_source != deterministic["selected_source"]
                 or bool(llm_decision and llm_decision.needs_review is False and not human_review_required)
             )
         )
         llm_residual_risk_flags = list(review_reason)
+        final_human_review_required_after_safety_gate = bool(human_review_required)
+        if final_human_review_required_after_safety_gate:
+            safety_gate_reasons = list(review_reason)
         llm_resolved = _llm_resolved_after_decision(
             llm_selected=llm_selected,
             llm_decision_applied=llm_decision_applied,
@@ -1581,13 +1783,15 @@ def select_final_candidates(
             stats["llm_decision_applied_count"] += 1
         if llm_selected:
             stats["llm_selected_candidate_count"] += 1
+        if llm_merged_candidate:
+            stats["llm_merged_candidate_count"] += 1
         if llm_resolved:
             stats["llm_cleared_human_review_count"] += 1
         elif llm_selected:
             stats["llm_kept_human_review_count"] += 1
         if llm_resolved:
             stats["llm_resolved_count"] += 1
-        if llm_selected or llm_called:
+        if llm_called:
             llm_audit_rows.append(
                 {
                     "block_id": segment["block_id"],
@@ -1597,13 +1801,22 @@ def select_final_candidates(
                     "final_text_after_llm": final_text,
                     "llm_selected_source": llm_selected_source,
                     "llm_final_text": llm_final_text,
+                    "llm_final_text_accepted": llm_final_text_accepted,
                     "llm_changed_final_text": llm_changed_final_text,
                     "llm_resolved": llm_resolved,
+                    "llm_merged_candidate": llm_merged_candidate,
+                    "llm_merge_spans": llm_merge_spans,
+                    "llm_candidate_out_of_set_violation": llm_candidate_out_of_set_violation,
+                    "llm_used_candidate_sources": llm_used_candidate_sources,
+                    "llm_confidence": llm_confidence,
                     "review_level_before_llm": "human_required" if pre_llm_needs_review else "machine_note",
                     "review_level_after_llm": review_level,
                     "candidate_texts": candidate_summary,
                     "llm_reason": llm_reason,
                     "llm_residual_risk_flags": llm_residual_risk_flags,
+                    "raw_llm_human_review_required_recommendation": raw_llm_human_review_required_recommendation,
+                    "final_human_review_required_after_safety_gate": final_human_review_required_after_safety_gate,
+                    "safety_gate_reasons": safety_gate_reasons,
                 }
             )
         suggested_final_text, suggestion_reasons = _without_leading_fragment_suggestion(final_text, candidate_summary.get("apple", ""))
@@ -1662,8 +1875,11 @@ def select_final_candidates(
             "final_text_raw": final_text_before_cleanup,
             "final_text_after_boundary_cleanup": final_text,
             "final_text_display": punctuation["display_text"],
-            "final_text_suspicious": _final_text_suspicious(final_text),
-            "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
+            "final_text_suspicious": bool(suspicious_details["final_text_suspicious"]),
+            "final_text_suspicious_level": suspicious_details["final_text_suspicious_level"],
+            "final_text_suspicious_reasons": list(suspicious_details["final_text_suspicious_reasons"]),
+            "final_text_suspicious_hard_reasons": list(suspicious_details["final_text_suspicious_hard_reasons"]),
+            "final_text_suspicious_soft_reasons": list(suspicious_details["final_text_suspicious_soft_reasons"]),
             "selected_source": selected_source,
             "selection_method": selection_method,
             "confidence": float(confidence),
@@ -1694,7 +1910,12 @@ def select_final_candidates(
             "llm_reason": llm_reason,
             "llm_used_candidate_sources": llm_used_candidate_sources,
             "llm_final_text_accepted": llm_final_text_accepted,
+            "llm_merged_candidate": llm_merged_candidate,
+            "llm_merge_spans": llm_merge_spans,
             "llm_human_review_required_recommendation": llm_human_review_required_recommendation,
+            "raw_llm_human_review_required_recommendation": raw_llm_human_review_required_recommendation,
+            "final_human_review_required_after_safety_gate": final_human_review_required_after_safety_gate,
+            "safety_gate_reasons": safety_gate_reasons,
             "llm_residual_risk_flags": llm_residual_risk_flags,
             "deterministic_resolution_available": bool(deterministic_resolution["deterministic_resolution_available"]),
             "deterministic_resolution_reason": deterministic_resolution["deterministic_resolution_reason"],
@@ -1820,8 +2041,11 @@ def select_final_candidates(
                     "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
                     "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
                     "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
-                    "final_text_suspicious": _final_text_suspicious(final_text),
-                    "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
+                    "final_text_suspicious": bool(suspicious_details["final_text_suspicious"]),
+                    "final_text_suspicious_level": suspicious_details["final_text_suspicious_level"],
+                    "final_text_suspicious_reasons": list(suspicious_details["final_text_suspicious_reasons"]),
+                    "final_text_suspicious_hard_reasons": list(suspicious_details["final_text_suspicious_hard_reasons"]),
+                    "final_text_suspicious_soft_reasons": list(suspicious_details["final_text_suspicious_soft_reasons"]),
                     "llm_used": bool(should_call),
                     "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
                     "selection_notes": llm_decision.notes if llm_decision is not None else "",
@@ -1890,8 +2114,11 @@ def select_final_candidates(
                     "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
                     "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
                     "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
-                    "final_text_suspicious": _final_text_suspicious(final_text),
-                    "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
+                    "final_text_suspicious": bool(suspicious_details["final_text_suspicious"]),
+                    "final_text_suspicious_level": suspicious_details["final_text_suspicious_level"],
+                    "final_text_suspicious_reasons": list(suspicious_details["final_text_suspicious_reasons"]),
+                    "final_text_suspicious_hard_reasons": list(suspicious_details["final_text_suspicious_hard_reasons"]),
+                    "final_text_suspicious_soft_reasons": list(suspicious_details["final_text_suspicious_soft_reasons"]),
                     "review_level": review_level,
                     "review_priority": review_priority,
                     "review_gate_reasons": review_gate_reasons,
@@ -1946,8 +2173,11 @@ def select_final_candidates(
                     "candidate_summary": candidate_summary,
                     "final_text": final_text,
                     "final_text_display": punctuation["display_text"],
-                    "final_text_suspicious": _final_text_suspicious(final_text),
-                    "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
+                    "final_text_suspicious": bool(suspicious_details["final_text_suspicious"]),
+                    "final_text_suspicious_level": suspicious_details["final_text_suspicious_level"],
+                    "final_text_suspicious_reasons": list(suspicious_details["final_text_suspicious_reasons"]),
+                    "final_text_suspicious_hard_reasons": list(suspicious_details["final_text_suspicious_hard_reasons"]),
+                    "final_text_suspicious_soft_reasons": list(suspicious_details["final_text_suspicious_soft_reasons"]),
                     "final_text_raw": final_text_before_cleanup,
                     "apple_text": candidate_summary.get("apple", ""),
                     "qwen_text": candidate_summary.get("qwen", ""),

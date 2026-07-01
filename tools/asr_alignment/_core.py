@@ -1469,6 +1469,10 @@ def normalize_source_choice(value: str | None) -> str | None:
         "candidate_b": "apple",
         "candidate_c": "nemotron",
         "candidate_d": "whisper",
+        "merged_candidate": "merged_candidates",
+        "merged_candidates": "merged_candidates",
+        "nochange": "no_change",
+        "no_change": "no_change",
     }
     return aliases.get(value, value)
 

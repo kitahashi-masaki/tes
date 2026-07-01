@@ -163,6 +163,8 @@ class LLMClient:
             "音声を聞いたふりをしてはいけません。\n"
             "候補A/B/C/Dの中から最も妥当なものを選んでください。\n"
             "必要なら、候補内の一部表記だけを組み合わせてもよいですが、候補にない語は追加禁止です。\n"
+            "候補を混ぜる場合は selected_source を merged_candidates にしてください。\n"
+            "変更不要なら selected_source を no_change にしても構いません。\n"
             "数字・固有名詞・専門語は特に慎重に扱ってください。\n"
             "不確実な場合は needs_review=true にしてください。\n"
             "出力は必ずJSONのみとしてください。\n"
@@ -229,7 +231,7 @@ class LLMClient:
             content = extract_chat_completion_text(response)
             parsed = parse_llm_response(content)
             selected_source = normalize_source_choice(parsed.get("selected_source") or parsed.get("candidate_id") or parsed.get("source"))
-            if selected_source not in {"apple", "qwen", "nemotron", "whisper"}:
+            if selected_source not in {"apple", "qwen", "nemotron", "whisper", "merged_candidates", "no_change"}:
                 raise ValueError(f"invalid selected_source: {selected_source}")
             decision = {
                 "selected_source": selected_source,
