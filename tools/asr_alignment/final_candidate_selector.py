@@ -620,6 +620,9 @@ def _machine_note_demotion_decision(
         return False, []
     if not deterministic_resolution.get("deterministic_resolution_available"):
         return False, []
+    reasons = list(deterministic_resolution.get("deterministic_resolution_reason") or [])
+    if "boundary_contamination_only" not in reasons:
+        return False, []
     if _final_text_suspicious(final_text):
         return False, []
     if not _final_text_natural(final_text, candidate_texts):
@@ -627,10 +630,11 @@ def _machine_note_demotion_decision(
     flags = set(str(flag) for flag in final_risk_flags)
     if "numeric_disagreement" in flags or "critical_term_disagreement" in flags or "domain_error_phrase" in flags:
         return False, []
-    if "boundary_contamination_suspected" in flags or "qwen_apple_disagreement" in flags:
-        reasons = list(deterministic_resolution.get("deterministic_resolution_reason") or [])
-        if "apple_whisper_agreement_high" not in reasons:
+    if "boundary_contamination_suspected" in flags:
+        if deterministic_resolution.get("apple_whisper_agreement_high") and "apple_whisper_agreement_high" not in reasons:
             reasons.insert(0, "apple_whisper_agreement_high")
+        if deterministic_resolution.get("apple_nemotron_whisper_agreement_high") and "apple_nemotron_whisper_agreement_high" not in reasons:
+            reasons.insert(0, "apple_nemotron_whisper_agreement_high")
         if "support_candidate_boundary_contamination" not in reasons:
             reasons.append("support_candidate_boundary_contamination")
         if "final_text_natural" not in reasons:
@@ -780,6 +784,8 @@ def _review_output_row(block: dict[str, Any], *, review_level: str, human_review
         "qwen_apple_similarity": float(block.get("qwen_apple_similarity") if block.get("qwen_apple_similarity") is not None else 0.0),
         "final_text_raw": final_text,
         "final_text_display": final_text_display,
+        "final_text_suspicious": _final_text_suspicious(final_text_display),
+        "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_patterns],
         "apple_text": apple_text,
         "qwen_text": qwen_text,
         "nemotron_text": nemotron_text,
@@ -1552,6 +1558,8 @@ def select_final_candidates(
             "final_text_raw": final_text_before_cleanup,
             "final_text_after_boundary_cleanup": final_text,
             "final_text_display": punctuation["display_text"],
+            "final_text_suspicious": _final_text_suspicious(final_text),
+            "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
             "selected_source": selected_source,
             "selection_method": selection_method,
             "confidence": float(confidence),
@@ -1690,6 +1698,8 @@ def select_final_candidates(
                     "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
                     "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
                     "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
+                    "final_text_suspicious": _final_text_suspicious(final_text),
+                    "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
                     "llm_used": bool(should_call),
                     "llm_cached": bool(llm_decision.cached) if llm_decision is not None else False,
                     "selection_notes": llm_decision.notes if llm_decision is not None else "",
@@ -1758,6 +1768,8 @@ def select_final_candidates(
                     "boundary_cleanup_reverted": bool(cleanup.get("boundary_cleanup_reverted")),
                     "cleanup_validation_failed": bool(cleanup.get("cleanup_validation_failed")),
                     "protected_prefix_prevented_cleanup": bool(cleanup.get("protected_prefix_prevented_cleanup")),
+                    "final_text_suspicious": _final_text_suspicious(final_text),
+                    "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
                     "review_level": review_level,
                     "review_priority": review_priority,
                     "review_gate_reasons": review_gate_reasons,
@@ -1803,6 +1815,8 @@ def select_final_candidates(
                     "candidate_summary": candidate_summary,
                     "final_text": final_text,
                     "final_text_display": punctuation["display_text"],
+                    "final_text_suspicious": _final_text_suspicious(final_text),
+                    "final_text_suspicious_reasons": [pattern["pattern_id"] for pattern in unusual_final_text_patterns],
                     "final_text_raw": final_text_before_cleanup,
                     "apple_text": candidate_summary.get("apple", ""),
                     "qwen_text": candidate_summary.get("qwen", ""),
