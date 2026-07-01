@@ -484,6 +484,32 @@ def _final_text_natural(text: str, candidate_texts: dict[str, str]) -> bool:
     )
 
 
+def _timeout_safe_fallback_source(candidate_rows: dict[str, dict[str, Any]], final_text: str) -> str:
+    candidate_texts = {src: str((candidate_rows.get(src) or {}).get("text") or "") for src in ("apple", "qwen", "nemotron", "whisper")}
+    candidates: list[tuple[float, str]] = []
+    for source in ("apple", "whisper", "nemotron"):
+        text = candidate_texts.get(source, "").strip()
+        if not text:
+            continue
+        if _final_text_suspicious_level(text) == "human_required":
+            continue
+        if not _final_text_natural(text, candidate_texts):
+            continue
+        score = segment_similarity_score(final_text, text)
+        if source == "apple":
+            score += 0.05
+        elif source == "whisper":
+            score += 0.03
+        candidates.append((score, source))
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][1]
+    for source in ("apple", "whisper", "nemotron"):
+        if candidate_texts.get(source, "").strip():
+            return source
+    return "apple"
+
+
 def _normalized_no_punct(text: str) -> str:
     return re.sub(r"[\s、。，．,.!?！？「」『』（）()\-‐‑‒–—…]+", "", str(text or ""))
 
@@ -1378,6 +1404,9 @@ def select_final_candidates(
         "llm_call_count": 0,
         "llm_success_count": 0,
         "llm_failure_count": 0,
+        "llm_timeout_count": 0,
+        "llm_timeout_fallback_applied_count": 0,
+        "qwen_suspicious_timeout_fallback_count": 0,
         "llm_cache_hit_count": 0,
         "llm_changed_final_text_count": 0,
         "llm_changed_needs_review_true_count": 0,
@@ -1491,6 +1520,7 @@ def select_final_candidates(
         llm_residual_risk_flags: list[str] = []
         llm_merge_spans: list[dict[str, str]] = []
         llm_merged_candidate = False
+        llm_timeout_fallback_applied = False
         review_reason = list(segment.get("risk_flags") or [])
         if qwen_downgrade_reasons:
             review_reason = merge_review_reasons(review_reason, qwen_downgrade_reasons)
@@ -1591,6 +1621,34 @@ def select_final_candidates(
                 stats["llm_failure_count"] += 1
                 failure_reason = llm_decision.error or "llm_failed"
                 review_reason = merge_review_reasons(review_reason, [failure_reason])
+                llm_timeout_like = any(token in failure_reason.lower() for token in ("timeout", "timed out", "urLError".lower(), "operation not permitted"))
+                qwen_is_suspicious = (
+                    selected_source == "qwen"
+                    and llm_candidate
+                    and ("critical_term_disagreement" in review_reason or "semantic" in review_reason or final_text_suspicious)
+                )
+                if llm_timeout_like and qwen_is_suspicious:
+                    fallback_source = _timeout_safe_fallback_source(candidate_rows, final_text)
+                    fallback_text = str(candidate_rows.get(fallback_source, {}).get("text") or "").strip()
+                    if fallback_text and fallback_source != "qwen":
+                        selected_source = fallback_source
+                        final_text_raw = fallback_text
+                        final_text = fallback_text
+                        confidence = float(candidate_rows.get(fallback_source, {}).get("combined_score", confidence) or confidence)
+                        selection_method = "timeout_safe_fallback"
+                        llm_timeout_fallback_applied = True
+                        llm_target = False
+                        llm_called = True
+                        llm_selected_source = fallback_source
+                        llm_final_text = fallback_text
+                        llm_human_review_required_recommendation = True
+                        raw_llm_human_review_required_recommendation = True
+                        final_human_review_required_after_safety_gate = True
+                        safety_gate_reasons = merge_review_reasons(review_reason, ["llm_timeout_safe_fallback"])
+                        review_reason = merge_review_reasons(review_reason, ["llm_timeout_safe_fallback"])
+                        stats["llm_timeout_count"] += 1
+                        stats["llm_timeout_fallback_applied_count"] += 1
+                        stats["qwen_suspicious_timeout_fallback_count"] += 1
 
         preferred_source, preferred_text, preferred_reasons = _domain_preferred_source(candidate_rows, selected_source, final_text)
         domain_candidate_switched = False
@@ -1655,7 +1713,7 @@ def select_final_candidates(
         if unusual_final_text_patterns and "unusual_final_text_pattern" not in final_risk_flags:
             final_risk_flags.append("unusual_final_text_pattern")
 
-        display_source_text = final_text if domain_text_corrected else _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
+        display_source_text = final_text if final_text else _select_display_source_text(candidate_rows, selected_source, candidate_summary.get("apple", ""))
         punctuation = {
             "display_text": display_source_text,
             "punctuation_hints": [],
@@ -1872,7 +1930,7 @@ def select_final_candidates(
             "qwen_apple_difference_type": segment.get("qwen_apple_difference_type"),
             "qwen_apple_similarity": float(segment.get("qwen_apple_similarity", 0.0) or 0.0),
             "final_text": final_text,
-            "final_text_raw": final_text_before_cleanup,
+            "final_text_raw": final_text,
             "final_text_after_boundary_cleanup": final_text,
             "final_text_display": punctuation["display_text"],
             "final_text_suspicious": bool(suspicious_details["final_text_suspicious"]),
@@ -1977,7 +2035,7 @@ def select_final_candidates(
                     "time": {"start_sec": unit.start_sec, "end_sec": unit.end_sec},
                     "apple_text": unit.text,
                     "final_text": final_text,
-                    "final_text_raw": final_text_before_cleanup,
+                    "final_text_raw": final_text,
                     "final_text_display": punctuation["display_text"],
                     "sentence_display_text": sentence_display_text,
                     "punctuation_hints": punctuation["punctuation_hints"],
@@ -2097,7 +2155,7 @@ def select_final_candidates(
                     "whisper_text": candidate_summary.get("whisper", ""),
                     "candidate_texts": candidate_summary,
                     "apple_boundary_hints": segment_boundary_hints,
-                    "final_text_raw": final_text_before_cleanup,
+                    "final_text_raw": final_text,
                     "final_text_display": punctuation["display_text"],
                     "punctuation_hints": punctuation["punctuation_hints"],
                     "punctuation_inserted_period_count": punctuation["punctuation_inserted_period_count"],
@@ -2178,7 +2236,7 @@ def select_final_candidates(
                     "final_text_suspicious_reasons": list(suspicious_details["final_text_suspicious_reasons"]),
                     "final_text_suspicious_hard_reasons": list(suspicious_details["final_text_suspicious_hard_reasons"]),
                     "final_text_suspicious_soft_reasons": list(suspicious_details["final_text_suspicious_soft_reasons"]),
-                    "final_text_raw": final_text_before_cleanup,
+                    "final_text_raw": final_text,
                     "apple_text": candidate_summary.get("apple", ""),
                     "qwen_text": candidate_summary.get("qwen", ""),
                     "nemotron_text": candidate_summary.get("nemotron", ""),

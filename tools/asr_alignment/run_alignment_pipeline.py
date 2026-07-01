@@ -550,6 +550,12 @@ def _build_summary(
         "boundary_hint_used_in_candidate_boundary_eval": boundary_hint_used_in_candidate_boundary_eval,
         "boundary_hint_used_in_cleanup": boundary_hint_used_in_cleanup,
         "final_text_raw_equals_display_count": final_text_raw_equals_display_count,
+        "final_text_raw_display_mismatch_count": sum(
+            1
+            for row in final_blocks
+            if str(row.get("final_text_raw", "")) != str(row.get("final_text_display", ""))
+        ),
+        "final_transcript_uses_accepted_llm_text": True,
         "final_text_display_changed_count": final_text_display_changed_count,
         "punctuation_normalized_count": punctuation_normalized_count,
         "punctuation_inserted_period_count": punctuation_inserted_period_count,
@@ -605,6 +611,9 @@ def _build_summary(
         "llm_call_count": llm_stats.get("llm_call_count", 0),
         "llm_success_count": llm_stats.get("llm_success_count", 0),
         "llm_failure_count": llm_stats.get("llm_failure_count", 0),
+        "llm_timeout_count": llm_stats.get("llm_timeout_count", 0),
+        "llm_timeout_fallback_applied_count": llm_stats.get("llm_timeout_fallback_applied_count", 0),
+        "qwen_suspicious_timeout_fallback_count": llm_stats.get("qwen_suspicious_timeout_fallback_count", 0),
         "llm_cache_hit_count": llm_stats.get("llm_cache_hit_count", 0),
         "llm_changed_final_text_count": llm_stats.get("llm_changed_final_text_count", 0),
         "llm_changed_needs_review_true_count": llm_stats.get("llm_changed_needs_review_true_count", 0),
@@ -715,6 +724,8 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- cleanup による final_text 変更件数: {summary['final_text_changed_by_cleanup_count']}")
     lines.append(f"- final_text_raw == display 件数: {summary['final_text_raw_equals_display_count']}")
     lines.append(f"- final_text_display 変更件数: {summary['final_text_display_changed_count']}")
+    lines.append(f"- final_text_raw_display_mismatch_count: {summary.get('final_text_raw_display_mismatch_count', 0)}")
+    lines.append(f"- final_transcript_uses_accepted_llm_text: {summary.get('final_transcript_uses_accepted_llm_text')}")
     lines.append(f"- suggested_final_text 件数: {summary.get('suggested_final_text_count', 0)}")
     lines.append(f"- boundary suggestion 件数: {summary.get('boundary_suggestion_count', 0)}")
     lines.append(f"- trailing boundary suggestion 件数: {summary.get('trailing_boundary_suggestion_count', 0)}")
