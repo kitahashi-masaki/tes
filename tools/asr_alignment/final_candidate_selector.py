@@ -558,6 +558,16 @@ def _deterministic_resolution_decision(block: dict[str, Any], candidate_texts: d
             "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
             "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
         }
+    if not any(flag in remaining_flags for flag in severe_flags) and not _has_unusual_final_text_pattern(final_text_display):
+        return {
+            "deterministic_resolution_available": True,
+            "deterministic_resolution_reason": [
+                "selected_source_apple",
+                "boundary_contamination_only",
+            ],
+            "apple_whisper_agreement_high": bool(metrics["apple_whisper_agreement_high"]),
+            "apple_nemotron_whisper_agreement_high": bool(metrics["apple_nemotron_whisper_agreement_high"]),
+        }
     if not metrics["apple_whisper_agreement_high"] and not metrics["apple_nemotron_whisper_agreement_high"]:
         return {
             "deterministic_resolution_available": False,
@@ -627,6 +637,104 @@ def _machine_note_demotion_decision(
             reasons.append("final_text_natural")
         return True, reasons
     return False, []
+
+
+def _machine_note_demotion_debug(
+    *,
+    episode_id: str,
+    block: dict[str, Any],
+    final_text: str,
+    final_risk_flags: list[str],
+    candidate_texts: dict[str, str],
+    deterministic_resolution: dict[str, Any],
+) -> dict[str, Any]:
+    flags = set(str(flag) for flag in final_risk_flags)
+    selected_source = str(block.get("selected_source") or "")
+    boundary_contamination_suspected = "boundary_contamination_suspected" in flags
+    critical_term_disagreement = "critical_term_disagreement" in flags
+    numeric_disagreement = "numeric_disagreement" in flags
+    domain_error_phrase = "domain_error_phrase" in flags
+    unusual_level = _unusual_final_text_pattern_level(final_text)
+    genuine_unusual_final_text_pattern = unusual_level == "human_required"
+    final_text_suspicious = _final_text_suspicious(final_text)
+    apple_whisper_agreement_high = bool(deterministic_resolution.get("apple_whisper_agreement_high"))
+    apple_nemotron_whisper_agreement_high = bool(deterministic_resolution.get("apple_nemotron_whisper_agreement_high"))
+    deterministic_resolution_available = bool(deterministic_resolution.get("deterministic_resolution_available"))
+    demote_applied, _ = _machine_note_demotion_decision(
+        selected_source=selected_source,
+        final_text=final_text,
+        final_risk_flags=final_risk_flags,
+        candidate_texts=candidate_texts,
+        deterministic_resolution=deterministic_resolution,
+    )
+    demote_blockers: list[str] = []
+    if selected_source != "apple":
+        demote_blockers.append("selected_source_not_apple")
+    if not boundary_contamination_suspected:
+        demote_blockers.append("not_boundary_contamination_only")
+    if critical_term_disagreement:
+        demote_blockers.append("critical_term_disagreement_present")
+    if numeric_disagreement:
+        demote_blockers.append("numeric_disagreement_present")
+    if domain_error_phrase:
+        demote_blockers.append("domain_error_phrase_present")
+    if genuine_unusual_final_text_pattern:
+        demote_blockers.append("genuine_unusual_final_text_pattern_present")
+    if final_text_suspicious:
+        demote_blockers.append("final_text_suspicious")
+    if not deterministic_resolution_available:
+        demote_blockers.append("deterministic_resolution_unavailable")
+    if not demote_applied:
+        if boundary_contamination_suspected and selected_source == "apple" and not any(
+            flag in flags
+            for flag in {
+                "critical_term_disagreement",
+                "numeric_disagreement",
+                "domain_error_phrase",
+            }
+        ):
+            if not deterministic_resolution_available:
+                demote_blockers.append("demote_logic_not_reached")
+            else:
+                demote_blockers.append("demote_result_not_written_to_final_blocks")
+        elif not demote_blockers:
+            demote_blockers.append("demote_logic_not_reached")
+    boundary_contamination_only = (
+        boundary_contamination_suspected
+        and selected_source == "apple"
+        and not critical_term_disagreement
+        and not numeric_disagreement
+        and not domain_error_phrase
+        and not genuine_unusual_final_text_pattern
+        and not final_text_suspicious
+    )
+    demote_candidate = selected_source == "apple" and boundary_contamination_suspected and not any(
+        flag in flags for flag in {"critical_term_disagreement", "numeric_disagreement", "domain_error_phrase", "genuine_unusual_final_text_pattern"}
+    )
+    return {
+        "episode_id": episode_id,
+        "block_id": block.get("block_id", ""),
+        "selected_source": selected_source,
+        "final_text_display": final_text,
+        "review_gate_reasons": list(block.get("review_gate_reasons") or []),
+        "risk_flags": list(block.get("risk_flags") or []),
+        "machine_note_reasons": list(block.get("machine_note_reasons") or []),
+        "demote_candidate": bool(demote_candidate),
+        "demote_applied": bool(demote_applied),
+        "demote_blockers": demote_blockers,
+        "selected_source_is_apple": selected_source == "apple",
+        "boundary_contamination_suspected": boundary_contamination_suspected,
+        "boundary_contamination_only": boundary_contamination_only,
+        "critical_term_disagreement": critical_term_disagreement,
+        "numeric_disagreement": numeric_disagreement,
+        "domain_error_phrase": domain_error_phrase,
+        "genuine_unusual_final_text_pattern": genuine_unusual_final_text_pattern,
+        "apple_whisper_agreement_high": apple_whisper_agreement_high,
+        "apple_nemotron_whisper_agreement_high": apple_nemotron_whisper_agreement_high,
+        "final_text_suspicious": final_text_suspicious,
+        "deterministic_resolution_available": deterministic_resolution_available,
+        "deterministic_resolution_reason": list(deterministic_resolution.get("deterministic_resolution_reason") or []),
+    }
 
 
 def _review_output_row(block: dict[str, Any], *, review_level: str, human_review_required: bool, machine_review_note: bool) -> dict[str, Any]:

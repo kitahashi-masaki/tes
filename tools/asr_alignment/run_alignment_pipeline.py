@@ -23,19 +23,20 @@ if __package__ is None or __package__ == "":
         load_jsonl,
         nfc_text,
         read_json_from_path,
+        save_jsonl,
         build_text_artifact,
     )
     from tools.asr_alignment.apple_timeline_builder import build_apple_timeline  # type: ignore
     from tools.asr_alignment.flat_text_aligner import align_engine_to_apple  # type: ignore
-    from tools.asr_alignment.final_candidate_selector import select_final_candidates  # type: ignore
+    from tools.asr_alignment.final_candidate_selector import _machine_note_demotion_debug, select_final_candidates  # type: ignore
     from tools.asr_alignment.llm_client import LLMClient  # type: ignore
     from tools.asr_alignment.normalize_fusion_flags import normalize_file  # type: ignore
     from tools.asr_alignment.segment_candidate_builder import build_block_candidates  # type: ignore
 else:
-    from ._core import AppleSentenceUnit, AlignmentBlock, AlignmentResult, NormEntry, TextArtifact, ensure_dir, load_episode_files, load_jsonl, nfc_text, read_json_from_path, build_text_artifact
+    from ._core import AppleSentenceUnit, AlignmentBlock, AlignmentResult, NormEntry, TextArtifact, ensure_dir, load_episode_files, load_jsonl, nfc_text, read_json_from_path, save_jsonl, build_text_artifact
     from .apple_timeline_builder import build_apple_timeline
     from .flat_text_aligner import align_engine_to_apple
-    from .final_candidate_selector import select_final_candidates
+    from .final_candidate_selector import _machine_note_demotion_debug, select_final_candidates
     from .llm_client import LLMClient
     from .normalize_fusion_flags import normalize_file
     from .segment_candidate_builder import build_block_candidates
@@ -91,6 +92,34 @@ def _jsonl_is_valid(path: Path) -> tuple[bool, int]:
 def _phrase_counts(texts: list[str], phrases: tuple[str, ...]) -> dict[str, int]:
     joined = "\n".join(str(text or "") for text in texts)
     return {phrase: joined.count(phrase) for phrase in phrases if phrase in joined}
+
+
+def _demote_debug_rows(final_blocks: list[dict[str, Any]], episode_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for block in final_blocks:
+        if not block.get("human_review_required"):
+            continue
+        candidate_texts = block.get("candidate_texts")
+        if not isinstance(candidate_texts, dict):
+            candidate_texts = {}
+        deterministic_resolution = {
+            "deterministic_resolution_available": bool(block.get("deterministic_resolution_available")),
+            "deterministic_resolution_reason": list(block.get("deterministic_resolution_reason") or []),
+            "apple_whisper_agreement_high": bool(block.get("apple_whisper_agreement_high")),
+            "apple_nemotron_whisper_agreement_high": bool(block.get("apple_nemotron_whisper_agreement_high")),
+        }
+        final_text = str(block.get("final_text_display") or block.get("final_text") or "")
+        rows.append(
+            _machine_note_demotion_debug(
+                episode_id=episode_id,
+                block=block,
+                final_text=final_text,
+                final_risk_flags=list(block.get("final_risk_flags") or block.get("risk_flags") or []),
+                candidate_texts={k: str(v or "") for k, v in candidate_texts.items()},
+                deterministic_resolution=deterministic_resolution,
+            )
+        )
+    return rows
 
 
 def _install_timed_print() -> None:
@@ -1011,6 +1040,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
         summary["review_sample_path"] = str(review_sample_path)
         summary["review_sample_count"] = len(review_sample_rows)
+        demote_debug_rows = _demote_debug_rows(final_blocks, episode_id)
+        demote_debug_short_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl"
+        demote_debug_short_md_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md"
+        save_jsonl(demote_debug_short_path, demote_debug_rows)
+        demote_lines = [f"# {episode_id}", "", "## demote_debug"]
+        for row in demote_debug_rows:
+            demote_lines.append(
+                f"- {row['block_id']}: candidate={row['demote_candidate']} applied={row['demote_applied']} blockers={row['demote_blockers']}"
+            )
+        demote_debug_short_md_path.write_text("\n".join(demote_lines) + "\n", encoding="utf-8")
+        summary["demote_debug_path"] = str(demote_debug_short_path)
+        summary["demote_debug_count"] = len(demote_debug_rows)
         summary["needs_review_count_final_blocks"] = sum(1 for row in final_blocks if row.get("needs_review"))
         summary["needs_review_count_normalized_blocks"] = sum(1 for row in block_rows if row.get("needs_review"))
         summary["human_review_required_count"] = sum(1 for row in final_blocks if row.get("human_review_required"))
@@ -1291,6 +1332,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     review_sample_path.write_text(json.dumps(review_sample_rows, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["review_sample_path"] = str(review_sample_path)
     summary["review_sample_count"] = len(review_sample_rows)
+    demote_debug_rows = _demote_debug_rows(final_blocks, episode_id)
+    demote_debug_short_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl"
+    demote_debug_short_md_path = output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md"
+    save_jsonl(demote_debug_short_path, demote_debug_rows)
+    demote_lines = [f"# {episode_id}", "", "## demote_debug"]
+    for row in demote_debug_rows:
+        demote_lines.append(
+            f"- {row['block_id']}: candidate={row['demote_candidate']} applied={row['demote_applied']} blockers={row['demote_blockers']}"
+        )
+    demote_debug_short_md_path.write_text("\n".join(demote_lines) + "\n", encoding="utf-8")
+    summary["demote_debug_path"] = str(demote_debug_short_path)
+    summary["demote_debug_count"] = len(demote_debug_rows)
     summary["llm_called_block_count"] = sum(1 for row in final_blocks if row.get("llm_called"))
     summary["llm_selected_count"] = sum(1 for row in final_blocks if row.get("llm_selected"))
     summary["llm_resolved_count"] = sum(1 for row in final_blocks if row.get("llm_resolved"))
@@ -1313,11 +1366,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "normalized_summary_json": output_dir / "reports" / f"{episode_id}.normalized_summary.json",
         "normalized_summary_md": output_dir / "reports" / f"{episode_id}.normalized_summary.md",
         "normalized_block_candidates": output_dir / "aligned_segments" / f"{episode_id}.block_candidates.jsonl",
-        "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
-        "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
-        "demoted_review_blocks": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl",
-        "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
-    }
+            "review_sample_blocks": output_dir / "reports" / f"{episode_id}.review_sample_blocks.json",
+            "machine_review_notes": output_dir / "fusion" / f"{episode_id}.machine_review_notes.jsonl",
+            "demoted_review_blocks": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.jsonl",
+            "demoted_review_blocks_md": output_dir / "fusion" / f"{episode_id}.demoted_review_blocks.md",
+            "demote_debug": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.jsonl",
+            "demote_debug_md": output_dir / "fusion" / f"{episode_id.split('-', 1)[0]}.demote_debug.md",
+        }
     output_validation = {}
     missing_output_files: list[str] = []
     for name, path in required_outputs.items():
